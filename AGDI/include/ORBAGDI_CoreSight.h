@@ -23,7 +23,6 @@ enum : uint32_t {
     kAtbIdItm    = 1u,           // ITM 的 TraceBusID
     kAtbIdEtm    = 2u,           // ETM 的 TRACEIDR，必须与 ITM 不同
 
-    kScsCpuid    = 0xE000ED00u,  // CPUID 基址寄存器
     kScsDemcr    = 0xE000EDFCu,  // DEMCR
     kDemcrTrcEna = 0x01000000u,  // DEMCR.TRCENA
 
@@ -128,15 +127,6 @@ bool ReadPid(orb::Dap& dap, uint32_t adr, bool r32, uint64_t& pid);
 
 /// 从 romBase 开始递归扫 ROM 表，把认出来的组件填进 out（不影响硬件状态）。
 bool ScanRomTable(orb::Dap& dap, uint32_t romBase, CsRomMap& out);
-
-// ---------------------------------------------------------------------------
-// CPUID
-// ---------------------------------------------------------------------------
-/// CPUID.PARTNO（bits 15:4）—— ARM 分配的内核编号。
-uint32_t CpuPartNo(uint32_t cpuid);
-
-/// PARTNO → 内核名；未识别返回 "unknown"。
-const char* CpuNameFromPartNo(uint32_t part);
 
 // ---------------------------------------------------------------------------
 // 寄存器原语

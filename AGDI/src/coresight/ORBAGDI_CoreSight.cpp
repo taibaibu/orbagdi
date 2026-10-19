@@ -1,33 +1,12 @@
 /**
  * @file ORBAGDI_CoreSight.cpp
- * @brief CoreSight 公共层的实现：CPUID 识别与寄存器原语。
+ * @brief CoreSight 公共层的实现：ROM 表扫描与寄存器原语。
  */
 #include "pch.h"
 #include "ORBAGDI_CoreSight.h"
 
 namespace orb {
 namespace agdi {
-
-uint32_t CpuPartNo(uint32_t cpuid)
-{
-    return (cpuid >> 4) & 0xFFFu;
-}
-
-const char* CpuNameFromPartNo(uint32_t part)
-{
-    // M0 / M1 没有任何 trace 部件，故意不给名字。
-    switch (part) {
-    case 0xC23u: return "Cortex-M3";
-    case 0xC24u: return "Cortex-M4";
-    case 0xC27u: return "Cortex-M7";
-    case 0xD21u: return "Cortex-M33";
-    case 0xD22u: return "Cortex-M55";
-    case 0xD23u: return "Cortex-M85";
-    case 0xC60u: return "Cortex-M0+";
-    case 0xD20u: return "Cortex-M23";
-    default:     return "unknown";
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ROM 表

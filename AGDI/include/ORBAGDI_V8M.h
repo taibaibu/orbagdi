@@ -9,6 +9,8 @@
 
 #include <stdint.h>
 
+#include "ORBAGDI_CpuId.h"   // kCpuCM* / IsV8M / IsV8MMainline / CpuTypeFromPartNo 的唯一来源
+
 namespace orb { class Dap; }
 
 namespace orb {
@@ -21,31 +23,6 @@ enum : unsigned {
     kSevErrAccess = 3, // Cannot access target
     kSevErrReinit = 4, // Cannot reinit target
 };
-
-// 参考实现的 ARM_CM* 枚举，调用方把自己识别的 CPU 映射到这套值上。
-enum : unsigned {
-    kCpuCM0    = 0,
-    kCpuCM0P   = 1,
-    kCpuCM1    = 2,
-    kCpuCM3    = 3,
-    kCpuCM4    = 4,
-    kCpuCM7    = 5,
-    kCpuSC000  = 6,
-    kCpuSC300  = 7,
-    kCpuCM23   = 8,   // v8-M Baseline
-    kCpuCM33   = 9,   // v8-M Mainline
-    kCpuCM35P  = 10,  // v8-M Mainline with Physical Security
-};
-
-// CM23 / CM33 / CM35P 是 v8-M，其余不是。
-bool IsV8M(unsigned cpuType);
-
-// CPUID.PARTNO → 上面的枚举。
-// 认不出的 PARTNO 映射成非 v8-M，避免凭空给未知器件加上安全扩展。
-unsigned V8mCpuTypeFromPartNo(unsigned partNo);
-
-// v8-M Mainline（CM33/CM35P）；Mainline 能读 NVIC_PFR1，Baseline 只能查 DBG_AUTHSTATUS。
-bool IsV8MMainline(unsigned cpuType);
 
 // 对应 pio->bSecureExt / bCPUSecure / b*DbgEna / b*TrcEna 与 DSCSR.CDSKEY。
 struct V8mStatus {

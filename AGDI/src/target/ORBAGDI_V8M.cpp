@@ -92,53 +92,6 @@ V8mPlayDeadFn g_playDead = nullptr;
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Classification
-// ---------------------------------------------------------------------------
-
-// DbgCM/AGDI.CPP:17958.
-bool IsV8M(unsigned cpuType)
-{
-    switch (cpuType) {
-    case kCpuCM0:   // ARM Cortex-M0
-    case kCpuCM0P:  // ARM Cortex-M0+
-    case kCpuCM1:   // ARM Cortex-M1
-    case kCpuCM3:   // ARM Cortex-M3
-    case kCpuCM4:   // ARM Cortex-M4
-    case kCpuSC000: // ARM SC000 (Secure Cortex-M0)
-    case kCpuSC300: // ARM SC300 (Secure Cortex-M3)
-    case kCpuCM7:   // ARM Cortex-M7
-        return false;
-    case kCpuCM23:  // ARM Cortex-M23 (v8-M Baseline)
-    case kCpuCM33:  // ARM Cortex-M33 (v8-M Mainline)
-    case kCpuCM35P: // ARM Cortex-M35P (v8-M Mainline with Physical Security)
-        return true;
-    }
-    return false;
-}
-
-bool IsV8MMainline(unsigned cpuType)
-{
-    return cpuType == kCpuCM33 || cpuType == kCpuCM35P;
-}
-
-// CPUID.PARTNO values (ARM Architecture Reference Manual, CPUID register).
-unsigned V8mCpuTypeFromPartNo(unsigned partNo)
-{
-    switch (partNo) {
-    case 0xC20: return kCpuCM0;   // Cortex-M0
-    case 0xC60: return kCpuCM0P;  // Cortex-M0+
-    case 0xC21: return kCpuCM1;   // Cortex-M1
-    case 0xC23: return kCpuCM3;   // Cortex-M3
-    case 0xC24: return kCpuCM4;   // Cortex-M4
-    case 0xC27: return kCpuCM7;   // Cortex-M7
-    case 0xD20: return kCpuCM23;  // Cortex-M23 (v8-M Baseline)
-    case 0xD21: return kCpuCM33;  // Cortex-M33 (v8-M Mainline)
-    case 0xD22: return kCpuCM35P; // Cortex-M35P (v8-M Mainline + Physical Security)
-    default:    return kCpuCM3;   // unknown -> classified as non-v8-M
-    }
-}
-
 V8mStatus V8mGetStatus()
 {
     return S().st;

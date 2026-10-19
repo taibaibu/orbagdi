@@ -343,9 +343,10 @@ void EtmTraceSelectProtocol(orb::Dap& dap)
     case EtmVariant::Mtb: p = ETM_PROTO_MTB;   break;
     case EtmVariant::V35: p = ETM_PROTO_ETM35; break;
     default:
-        // M0 / M1 没有任何 trace 部件；认不出的 PARTNO 先按 v3.5 试。
-        if (prof.etm == EtmVariant::None && part != 0xC20u && part != 0xC21u) {
-            ORB_LOG_WARN("ETM: PARTNO 0x%03X (CPUID=0x%08X) 没有已知 ETM —— 按 ETMv3.5 处理",
+        // M0 / M1 本来就没有 ETM（表里 etm=None）；只有 PARTNO 认不出时才值得警告，
+        // 表里给的是"没有 trace 出口"而不是"我们不知道"。
+        if (prof.desc == nullptr) {
+            ORB_LOG_WARN("ETM: PARTNO 0x%03X (CPUID=0x%08X) 不在内核表里 —— 按 ETMv3.5 处理",
                          part, cpuid);
         }
         p = ETM_PROTO_ETM35;

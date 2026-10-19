@@ -24,77 +24,30 @@ bool ProbeTarget(orb::Dap& dap, TargetProfile& out)
 {
     out = TargetProfile();
 
-    uint32_t cpuid = 0;
-    if (!dap.MemRead32(kScsCpuid, cpuid) || cpuid == 0 || cpuid == 0xFFFFFFFFu) {
+    const CpuId id = ReadCpuId(dap);
+    if (!id.valid) {
         // ARM 的 CPUID 读不到。RISC-V 没有这颗寄存器，将来在这里探测
         // misa / dmstatus 并把 arch 置为 TraceArch::RiscV。
         return false;
     }
 
-    out.cpuid    = cpuid;
-    out.partNo   = CpuPartNo(cpuid);
-    out.coreName = CpuNameFromPartNo(out.partNo);
+    out.cpuid  = id.cpuid;
+    out.partNo = id.partNo;
 
-    switch (out.partNo) {
-    case 0xC20u:  // Cortex-M0
-    case 0xC21u:  // Cortex-M1
-        out.arch = TraceArch::ArmV6M;
-        out.etm  = EtmVariant::None;
-        break;
-    case 0xC60u:  // Cortex-M0+
-        out.arch = TraceArch::ArmV6M;
-        out.etm  = EtmVariant::Mtb;
-        break;
-    case 0xC23u:  // Cortex-M3
-    case 0xC24u:  // Cortex-M4
-        out.arch = TraceArch::ArmV7M;
-        out.etm  = EtmVariant::V35;
-        break;
-    case 0xC27u:  // Cortex-M7
-        out.arch = TraceArch::ArmV7M;
-        out.etm  = EtmVariant::V4;
-        break;
-    case 0xD20u:  // Cortex-M23
-        out.arch = TraceArch::ArmV8M;
-        out.etm  = EtmVariant::Mtb;
-        break;
-    case 0xD21u:  // Cortex-M33
-    case 0xD22u:  // Cortex-M55
-    case 0xD23u:  // Cortex-M85
-        out.arch = TraceArch::ArmV8M;
-        out.etm  = EtmVariant::V4;
-        break;
-    default:
+    if (!id.desc) {
         // CPUID 能读但 PARTNO 不认识：仍按 v7-M 处理，ETM 变种交给调用方兜底。
         out.arch = TraceArch::ArmV7M;
         out.etm  = EtmVariant::None;
         ORB_LOG_WARN("TraceBehavior: 未识别的 PARTNO 0x%03X (CPUID=0x%08X)，按 ARMv7-M 处理",
-                     out.partNo, cpuid);
-        break;
+                     out.partNo, out.cpuid);
+        return true;
     }
 
+    out.coreName = id.desc->name;
+    out.arch     = id.desc->arch;
+    out.etm      = id.desc->etm;
+    out.desc     = id.desc;
     return true;
-}
-
-const char* ArchName(TraceArch a)
-{
-    switch (a) {
-    case TraceArch::ArmV6M: return "ARMv6-M";
-    case TraceArch::ArmV7M: return "ARMv7-M";
-    case TraceArch::ArmV8M: return "ARMv8-M";
-    case TraceArch::RiscV:  return "RISC-V";
-    default:                return "unknown";
-    }
-}
-
-const char* EtmVariantName(EtmVariant v)
-{
-    switch (v) {
-    case EtmVariant::Mtb: return "MTB";
-    case EtmVariant::V35: return "ETMv3.5";
-    case EtmVariant::V4:  return "ETMv4";
-    default:              return "none";
-    }
 }
 
 bool TraceClockOn(orb::Dap& dap)

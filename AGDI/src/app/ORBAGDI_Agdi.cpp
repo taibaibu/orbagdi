@@ -505,23 +505,28 @@ bool Connect() {
     SetApAccSizes(c.dap.DapIndex(), c.dap.ApIndex(),
                   AP_ACCSZ_BYTE | AP_ACCSZ_HWORD | AP_ACCSZ_WORD);
 
-        // v8-M 安全扩展探测：DP 已应答，放在 connect 做；v7-M 读一次 CPUID 即返回否。
+        // 目标识别：一次 CPUID 读出内核名/架构/ETM 变种（表在 ORBAGDI_CpuId.cpp）。
+        // v8-M 安全扩展探测也挂在这里；v7-M 判定为非 v8-M 即跳过。
     {
-        uint32_t cpuid = 0;
-        if (c.dap.MemRead32(orb::kScsCpuid, cpuid)) {
-            const unsigned partNo = (cpuid >> 4) & 0xFFFu;
-            const unsigned cpu    = orb::agdi::V8mCpuTypeFromPartNo(partNo);
-            if (orb::agdi::IsV8M(cpu)) {
-                if (!orb::agdi::V8mDetectSecurityExtensions(c.dap, cpu)) {
-                    ORB_LOG_WARN("AGDI: v8-M security extension detection failed");
-                } else {
-                    const orb::agdi::V8mStatus vs = orb::agdi::V8mGetStatus();
-                    ORB_LOG_INFO("AGDI: v8-M CPU (part 0x%03X) SecureExt=%d "
-                                 "CPU=%s SDbgEna=%d NSDbgEna=%d",
-                                 partNo, vs.secureExt ? 1 : 0,
-                                 vs.cpuSecure ? "Secure" : "Non-Secure",
-                                 vs.sDbgEna ? 1 : 0, vs.nsDbgEna ? 1 : 0);
-                }
+        const orb::agdi::CpuId id = orb::agdi::ReadCpuId(c.dap);
+        if (id.valid) {
+            ORB_LOG_INFO("AGDI: CPUID=0x%08X PARTNO=0x%03X -> %s (%s, %s)",
+                         id.cpuid, id.partNo,
+                         id.desc ? id.desc->name : "unknown",
+                         orb::agdi::ArchName(id.desc ? id.desc->arch : orb::agdi::TraceArch::Unknown),
+                         orb::agdi::EtmVariantName(id.desc ? id.desc->etm : orb::agdi::EtmVariant::None));
+        }
+        if (id.desc != nullptr && orb::agdi::IsV8M(id.desc->cpu)) {
+            const unsigned cpu = id.desc->cpu;
+            if (!orb::agdi::V8mDetectSecurityExtensions(c.dap, cpu)) {
+                ORB_LOG_WARN("AGDI: v8-M security extension detection failed");
+            } else {
+                const orb::agdi::V8mStatus vs = orb::agdi::V8mGetStatus();
+                ORB_LOG_INFO("AGDI: v8-M CPU %s (part 0x%03X) SecureExt=%d "
+                             "CPU=%s SDbgEna=%d NSDbgEna=%d",
+                             id.desc->name, id.partNo, vs.secureExt ? 1 : 0,
+                             vs.cpuSecure ? "Secure" : "Non-Secure",
+                             vs.sDbgEna ? 1 : 0, vs.nsDbgEna ? 1 : 0);
             }
         }
     }
