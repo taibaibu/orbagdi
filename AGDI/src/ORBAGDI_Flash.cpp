@@ -473,7 +473,7 @@ bool CallAlg(uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t& resul
     // Bracket every call in the log.  A MEM-AP transfer that never returns
     // blocks uVision's thread, and then the *last* log line is the only thing
     // that says which call did it (bug.md E14).
-    const DWORD tEnter = GetTickCount();
+    const uint64_t tEnter = GetTickCount64();
     ORB_LOG_INFO("Flash: call 0x%08X(0x%08X, 0x%08X, 0x%08X)", fn, r0, r1, r2);
 
     // The registers below are written through DCRSR, which the hardware only
@@ -576,7 +576,7 @@ bool CallAlg(uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t& resul
         return false;
     }
 
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     bool halted = false;
     struct bom* bom = orb::pdsc::Bom();
     for (;;) {
@@ -597,7 +597,7 @@ bool CallAlg(uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t& resul
         // transport, and UV_DOXEVENTS above is what keeps uVision alive.  A 1 ms
         // sleep on top of the read is pure detection latency, and a sector erase
         // pays it ~2000 times.
-        if (GetTickCount() - t0 >= kAlgTimeoutMs) {
+        if (GetTickCount64() - t0 >= kAlgTimeoutMs) {
             // Stop the core *before* reading it back: a DCRSR access while the
             // core runs is ignored, so the reads return the last value pushed
             // through DCRDR - which is why E12's dump showed 0x01000000 three
@@ -723,7 +723,7 @@ bool CallAlg(uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t& resul
 
     ORB_LOG_INFO("Flash: 0x%08X -> %s after %u ms", fn,
                  halted ? "halted at the sentinel" : "did not halt",
-                 static_cast<unsigned>(GetTickCount() - tEnter));
+                 static_cast<unsigned>(GetTickCount64() - tEnter));
 
     // The register file is deliberately NOT restored here: the session restores
     // it once, in FlashAlgLeave().  Restoring per call is what made a 300-call

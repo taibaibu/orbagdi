@@ -631,7 +631,7 @@ bool EtmSetProgbit(orb::Dap& dap, bool on, const char* what)
     const uint32_t want = on ? (cr | kEtmCrProgramBit) : (cr & ~kEtmCrProgramBit);
     if (want != cr) dap.MemWrite32(etm + kOffEtmCr, want);
 
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     uint32_t sr = 0;
     for (;;) {
         if (!dap.MemRead32(etm + kOffEtmSr, sr)) {
@@ -641,10 +641,10 @@ bool EtmSetProgbit(orb::Dap& dap, bool on, const char* what)
         if (((sr & kEtmSrProgbit) != 0) == on) {
             ORB_LOG_INFO("ITM: %s 握手完成 (ETMCR 0x%08X -> 0x%08X, ETMSR=0x%08X, "
                          "%u ms)", what, cr, want, sr,
-                         (unsigned)(GetTickCount() - t0));
+                         (unsigned)(GetTickCount64() - t0));
             return true;
         }
-        if ((GetTickCount() - t0) >= kEtmSrPollMs) {
+        if ((GetTickCount64() - t0) >= kEtmSrPollMs) {
             ORB_LOG_WARN("ITM: %s 后等了 %u ms，ETMSR[1] 仍未变为 %d (ETMSR=0x%08X, "
                          "ETMCR=0x%08X)", what, (unsigned)kEtmSrPollMs, on ? 1 : 0, sr, want);
             return false;
@@ -1326,7 +1326,7 @@ unsigned ItmPump(orb::Dap& dap, unsigned timeMs)
     // 时间预算，不是字节上限（官方 `Trace_Read(time, ts)` 同口径）。0 会变成
     // "一轮都不跑"，所以兜一个最小值。
     if (timeMs == 0) timeMs = 1;
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
 
     for (;;) {
         int n  = (int)sizeof(buf);
@@ -1359,7 +1359,7 @@ unsigned ItmPump(orb::Dap& dap, unsigned timeMs)
             }
         }
         if (n < (int)sizeof(buf)) break;               // drained
-        if ((GetTickCount() - t0) >= timeMs) break;    // 预算用完
+        if ((GetTickCount64() - t0) >= timeMs) break;    // 预算用完
     }
     return total;
 }

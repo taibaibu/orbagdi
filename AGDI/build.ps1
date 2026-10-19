@@ -17,7 +17,8 @@
     Usage:
         .\build.ps1                 # build (incremental)
         .\build.ps1 -Force          # rebuild every source regardless
-        .\build.ps1 -Clean          # clean object/bin folders
+        .\build.ps1 -Clean          # delete obj\ and bin\, then exit
+        .\build.ps1 -Clean -Deploy  # full rebuild from scratch, then deploy
         .\build.ps1 -Deploy         # build then deploy to Keil ARM\BIN
         .\build.ps1 -DeployOnly     # deploy existing bin\ORB_AGDI.dll
 #>
@@ -89,11 +90,69 @@ function Write-Err ([string]$msg) { Write-Diag "*** $msg" }
 
 # ---------------------------------------------------------------------------
 # Clean
+#
+# `-Clean` 删掉 obj\ 与 bin\（obj\dep\ 的依赖索引一并消失，所以下一次一定是
+# 全量编译），并且**在一切其它步骤之前**执行，因此可以和 -Force / -Deploy
+# 叠用（"推倒重建再部署"）。没有要求构建时直接退出，保持原有语义。
+#
+# 为什么不能只写一行 Remove-Item：部署过之后 bin\ORB_AGDI.dll 仍被 uVision
+# 映射着，Remove-Item 抛 .NET IOException，而 $ErrorActionPreference='Stop'
+# 会**绕过 Fail()** 直接终止脚本 —— 用户只看到一行宿主抛的原始异常，连前面
+# 删掉哪些目录都看不到（同文件头注释 ②）。所以这里捕获异常、逐个文件探测
+# 占用，把"该关掉谁"说清楚。
 # ---------------------------------------------------------------------------
 if ($Clean) {
     Write-Step 'Cleaning'
+
+    # 守卫：只许删本工程的 obj\ 与 bin\。**部署到 Keil 的那份不受影响** ——
+    # $Deploy 走的是 Copy-Item，ARM\BIN\ORB_AGDI.dll 是一份独立副本，clean
+    # 从头到尾都不碰 Keil 的安装目录。
+    #
+    # 把这条约束写成代码，防的是两种手滑：
+    #   ① 有人把 $BinDir 直接改成 ARM\BIN，想省掉复制这一步；
+    #   ② 有人把 bin\ 做成指向 ARM\BIN 的 junction —— PS 5.1 的
+    #      Remove-Item -Recurse 在 reparse point 上删除目标内容的记录是有过的，
+    #      一旦删穿，整个 Keil 安装目录就没了。
+    $projRoot = [System.IO.Path]::GetFullPath($ScriptDir).TrimEnd('\') + '\'
     foreach ($d in @($ObjDir, $BinDir)) {
-        if (Test-Path $d) { Remove-Item -Recurse -Force $d; Write-Ok "removed $d" }
+        $full = [System.IO.Path]::GetFullPath($d)
+        if (-not $full.StartsWith($projRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Fail "refusing to clean '$full' - outside the project folder ($projRoot)"
+        }
+        $info = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+        if ($info -and ($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Fail "refusing to clean '$full' - it is a junction/symlink; remove it by hand"
+        }
+    }
+
+    foreach ($d in @($ObjDir, $BinDir)) {
+        if (-not (Test-Path -LiteralPath $d)) { Write-Ok "$d  (absent)"; continue }
+        try {
+            Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction Stop
+            Write-Ok "removed $d"
+        } catch {
+            $why = $_.Exception.Message
+
+            # Remove-Item 会删掉能删的、留下不能删的，所以走一遍残留文件，
+            # 用独占打开探测谁还被占着。
+            $held = @()
+            Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    try {
+                        [System.IO.File]::Open($_.FullName, 'Open', 'ReadWrite', 'None').Dispose()
+                    } catch {
+                        $held += $_.FullName
+                    }
+                }
+            if ($held.Count -gt 0) {
+                Write-Err "cannot remove $d - still in use:"
+                $held | ForEach-Object { Write-Diag "    $_" }
+                Write-Diag '    Close uVision (it keeps ORB_AGDI.dll loaded) and retry.'
+            } else {
+                Write-Err "cannot remove ${d}: $why"
+            }
+            Fail 'clean failed'
+        }
     }
     if (-not ($Deploy -or $DeployOnly)) { Write-Host 'Done.'; exit 0 }
 }

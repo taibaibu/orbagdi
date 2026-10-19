@@ -317,7 +317,7 @@ void CodeImagePreloadFlash(CodeImageMemFn read, void* ctx)
         return;
     }
 
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     unsigned long long done = 0;
     unsigned reads = 0;
     bool failed = false;
@@ -339,7 +339,7 @@ void CodeImagePreloadFlash(CodeImageMemFn read, void* ctx)
     ORB_LOG_INFO("CodeImage: Flash 预读%s —— 0x%08X + %llu B / %u 次读 / %u ms"
                  "（会话缓存，热路径此后零探针访问）%s",
                  failed ? "**中断**" : "完成", c.iromStart, done, reads,
-                 static_cast<unsigned>(GetTickCount() - t0),
+                 static_cast<unsigned>(GetTickCount64() - t0),
                  failed ? "；读到一半失败，已读到的部分照用" : "");
 }
 

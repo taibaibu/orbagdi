@@ -483,7 +483,7 @@ bool Dap::PowerUpDebug() {
 
     // Keil waits up to 1 s here; keep the same budget.
     uint32_t v = 0;
-    const DWORD start = GetTickCount();
+    const uint64_t start = GetTickCount64();
     bool powered = false;
     for (;;) {
         if (!ReadDP(DAP_DP_REG_CTRL_STAT, v)) {
@@ -491,7 +491,7 @@ bool Dap::PowerUpDebug() {
             return false;
         }
         if ((v & ack) == ack) { powered = true; break; }
-        if ((GetTickCount() - start) >= 1000u) break;
+        if ((GetTickCount64() - start) >= 1000u) break;
         Sleep(1);
     }
 

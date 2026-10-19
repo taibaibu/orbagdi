@@ -20,14 +20,21 @@
 #define ATRX_BREAK   0x00000400u
 #define ATRX_BPDIS   0x00000800u
 
-// AG_MemAtt() attribute bits (own definition; ARM does not ship them).
-#define ATR_READ     0x00000001u
-#define ATR_WRITE    0x00000002u
-#define ATR_EXEC     0x00000004u
-#define ATR_BREAK    0x00000008u
-#define ATR_NOMAP    0x00000010u
-
 namespace orb {
+
+// AG_MemAtt() attribute bits (own definition; ARM does not ship them).
+//
+// These used to be macros named ATR_READ / ATR_WRITE / ATR_EXEC / ATR_BREAK,
+// which collide with BOM.H's identically-named set that means something
+// different (there ATR_EXEC is 0x01, here 0x04).  As macros, whichever header
+// was included first silently won - the C4005 the compiler emits was the only
+// hint that the value could differ.  Typed constants inside a namespace cannot
+// be shadowed by a #define, so the ambiguity is gone for good.
+inline constexpr uint32_t kAtrRead  = 0x00000001u;
+inline constexpr uint32_t kAtrWrite = 0x00000002u;
+inline constexpr uint32_t kAtrExec  = 0x00000004u;
+inline constexpr uint32_t kAtrBreak = 0x00000008u;
+inline constexpr uint32_t kAtrNomap = 0x00000010u;
 
 // None/Hw/Sw are execution breakpoints; Watch is a data-address watchpoint
 // implemented with a DWT address comparator.

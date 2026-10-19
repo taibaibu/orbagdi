@@ -107,11 +107,11 @@ void OnFrame(const OflowFrame& f, void* /*user*/)
     // 通道号对不上，光看计数永远看不出是几 —— 得看原始字节。
     if (s.framesLogged < 3) {
         ++s.framesLogged;
-        char hex[3 * 40 + 4];
-        int n = 0;
+        char   hex[3 * 40 + 4] = {0};
+        size_t n = 0;
         const unsigned show = (f.len < 40) ? f.len : 40;
-        for (unsigned i = 0; i < show && n + 3 < (int)sizeof(hex); ++i) {
-            n += _snprintf_s(hex + n, sizeof(hex) - n, _TRUNCATE, "%02X ", f.data[i]);
+        for (unsigned i = 0; i < show; ++i) {
+            orb::fmt::Append(hex, sizeof(hex), n, "%02X ", f.data[i]);
         }
         ORB_LOG_INFO("orbtrace: 帧 tag=%u len=%u good=%d : %s%s",
                      f.tag, f.len, f.good ? 1 : 0, hex, (f.len > show) ? "..." : "");
@@ -479,8 +479,8 @@ void OrbTraceStop(orb::Dap& dap)
     if (st.otherFrames) {
         bool used[256];
         memset(used, 0, sizeof(used));
-        char line[512];
-        int  n = 0;
+        char   line[512] = {0};
+        size_t n = 0;
         for (int shown = 0; shown < 8; ++shown) {
             int      best  = -1;
             unsigned long long bestB = 0;
@@ -493,12 +493,11 @@ void OrbTraceStop(orb::Dap& dap)
             // 格式串保持 ASCII：窄字符串字面量里的非 ASCII 会让 cl 报 C4819
             // （"该文件包含不能在当前代码页中表示的字符"，行号指在这一行）。
             // 注释里的中文不触发，所以这里只有这一处要写成英文。
-            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+            orb::fmt::Append(line, sizeof(line), n,
                              "%stag %d: %u frames / %llu B",
                              (n ? "  " : ""), best, s.tagFrames[best], s.tagBytes[best]);
-            if (n < 0) break;
         }
-        if (n > 0) {
+        if (n) {
             ORB_LOG_WARN("orbtrace: 丢弃的 tag（只认 1=ITM / 2=ETM）—— %s", line);
         }
     }
@@ -564,13 +563,13 @@ unsigned OrbTracePullRaw(orb::Dap& dap, uint8_t* out, unsigned cap, unsigned tim
     // `round < 32` 是隐含的 2 MB 上限，与链路速率无关 —— 换成 USB3/USB4 时它会
     // 先成为硬天花板（Todo.md §六 C2）。
     if (timeMs == 0) timeMs = 1;
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
 
     unsigned total = 0;
 
     for (;;) {
         if ((cap - total) < kChunk) break;                     // 装不下下一整块
-        if (total && (GetTickCount() - t0) >= timeMs) break;   // 预算用完（至少读一次）
+        if (total && (GetTickCount64() - t0) >= timeMs) break;   // 预算用完（至少读一次）
 
         int n  = (int)kChunk;
         const int rc = api.TraceStream_Read(h, &n, out + total, 0);   // 0 = 非阻塞（环里取）
@@ -631,7 +630,7 @@ unsigned OrbTracePump(orb::Dap& dap, unsigned timeMs)
     static uint8_t buf[64 * 1024];
 
     if (timeMs == 0) timeMs = 1;
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
 
     unsigned total = 0;
     for (;;) {
@@ -640,7 +639,7 @@ unsigned OrbTracePump(orb::Dap& dap, unsigned timeMs)
         total += n;
         OrbTraceDecodeRaw(buf, n);
         if (n < sizeof(buf)) break;                             // 环已排空
-        if ((GetTickCount() - t0) >= timeMs) break;             // 预算用完
+        if ((GetTickCount64() - t0) >= timeMs) break;             // 预算用完
     }
     return total;
 }

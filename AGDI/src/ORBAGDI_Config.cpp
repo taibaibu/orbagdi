@@ -137,7 +137,9 @@ const ExtraKey kExtraKeys[] = {
     //   `test/` 下所有脚本本来就是显式传 `pcperiod=1` 的，默认值反而与它们不一致。
     { "pcperiod",  KeyType::Bool, offsetof(Config, pcPeriodic),        1 },
     { "pcdrw",     KeyType::Bool, offsetof(Config, pcDataRw),          0 },
-    { "ports",     KeyType::Uint, offsetof(Config, itmPorts),          0xFFFFFFFF },
+    // 默认全 1 = "所有 ITM 端口都使能"。`def` 是 int，写 0xFFFFFFFF 会触发
+    // C4838 收缩转换（位模式其实一样），这里直接写 -1 让值和类型对得上。
+    { "ports",     KeyType::Uint, offsetof(Config, itmPorts),          -1 },
     { "priv",      KeyType::Uint, offsetof(Config, itmPriv),           0x00000008 },
     // trunlim: "Unlimited Trace"（等价 DbgCM 的 UNLIMITED_TRACE）。本驱动的块链
     // （P1-1）本来就是无上限，这一位的作用是把它报进 TraceOpt 给 uVision。

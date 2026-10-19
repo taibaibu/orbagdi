@@ -510,18 +510,18 @@ bool EtbStopCapture(orb::Dap& dap)
 
     // Wait for acquisition complete, then for the formatter pipe to drain.
     uint32_t val = 0;
-    DWORD t = GetTickCount();
+    uint64_t t = GetTickCount64();
     do {
         if (!EtbRd(dap, kOffStatus, val)) return false;
         if (val & kStatusAcqComp) break;
-    } while ((GetTickCount() - t) < 10);
+    } while ((GetTickCount64() - t) < 10);
 
     if ((val & kStatusDfEmpty) == 0) {
-        t = GetTickCount();
+        t = GetTickCount64();
         do {
             if (!EtbRd(dap, kOffStatus, val)) return false;
             if (val & kStatusDfEmpty) break;
-        } while ((GetTickCount() - t) < 10);
+        } while ((GetTickCount64() - t) < 10);
     }
 
     EtbWr(dap, kOffFfcr, 0);
@@ -715,11 +715,11 @@ bool EtbFlush(orb::Dap& dap)
     ffcr |= kFfcrFonman;                      // trigger a manual flush
     if (!EtbWr(dap, kOffFfcr, ffcr)) return false;
 
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     do {
         if (!EtbRd(dap, kOffFfcr, ffcr)) return false;
         if ((ffcr & kFfcrFonman) == 0) return true;
-    } while ((GetTickCount() - t0) < 10);
+    } while ((GetTickCount64() - t0) < 10);
 
     ORB_LOG_WARN("ETB: flush did not complete in time");
     return false;

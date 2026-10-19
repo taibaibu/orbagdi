@@ -356,14 +356,14 @@ bool Core::IsHalted() {
 
 bool Core::WaitForHalt(uint32_t timeoutMs) {
     if (!m_attached) return false;
-    const DWORD start = GetTickCount();
+    const uint64_t start = GetTickCount64();
     for (;;) {
         uint32_t dhcsr = 0;
         if (m_dap->MemRead32(kDcbDhcsr, dhcsr)) {
             if (dhcsr & kDhcsrSLockup) return true; // locked up counts as stopped
             if (dhcsr & kDhcsrSHalt)   return true;
         }
-        if (GetTickCount() - start >= timeoutMs) return false;
+        if (GetTickCount64() - start >= timeoutMs) return false;
     }
 }
 
@@ -371,13 +371,13 @@ bool Core::WaitForHalt(uint32_t timeoutMs) {
 // Registers
 // ---------------------------------------------------------------------------
 bool Core::WaitRegReady(uint32_t timeoutMs) {
-    const DWORD start = GetTickCount();
+    const uint64_t start = GetTickCount64();
     for (;;) {
         uint32_t dhcsr = 0;
         if (m_dap->MemRead32(kDcbDhcsr, dhcsr)) {
             if (dhcsr & kDhcsrSRegRdy) return true;
         }
-        if (GetTickCount() - start >= timeoutMs) return false;
+        if (GetTickCount64() - start >= timeoutMs) return false;
     }
 }
 

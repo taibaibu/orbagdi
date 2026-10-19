@@ -148,11 +148,16 @@ void AttrClear() {
 // which is what AG_BpInfo(AG_CADRVALID) actually asks (DbgCM/AGDI.CPP:7537 maps
 // an unmapped address and fails if it is still unmapped afterwards).
 struct MemMapStore {
+    enum { kMax = 64 };
     CRITICAL_SECTION cs;
     struct Range { uint32_t start, end, attr; };
-    Range            r[64];
+    Range            r[kMax];
     int              n;
-    MemMapStore() : n(0) { InitializeCriticalSection(&cs); }
+    // 因段表满而丢弃的次数。uVision 要映射多少段不受我们控制，超了之后
+    // AG_BpInfo(AG_CADRVALID) 会开始回答"未映射"——表现为断点随机失效，
+    // 而日志里什么都没有。至少把这个"为什么"留下来（只在第一次丢时打日志）。
+    unsigned         dropped;
+    MemMapStore() : n(0), dropped(0) { InitializeCriticalSection(&cs); }
 };
 
 MemMapStore& MemMap() {
@@ -163,6 +168,7 @@ MemMapStore& MemMap() {
 void MapMem(uint32_t adr, uint32_t len, uint32_t attr) {
     if (len == 0) return;
     MemMapStore& m = MemMap();
+    bool warn = false;
     EnterCriticalSection(&m.cs);
     for (int i = 0; i < m.n; ++i) {
         if (adr >= m.r[i].start && adr < m.r[i].end) {   // already covered
@@ -170,19 +176,29 @@ void MapMem(uint32_t adr, uint32_t len, uint32_t attr) {
             return;
         }
     }
-    if (m.n < 64) {
+    if (m.n < MemMapStore::kMax) {
         m.r[m.n].start = adr;
         m.r[m.n].end   = adr + len;
         m.r[m.n].attr  = attr;
         ++m.n;
+    } else if (m.dropped++ == 0) {
+        warn = true;                                     // 只在第一次丢时报
     }
     LeaveCriticalSection(&m.cs);
+    // 日志放在临界区外：它要开文件，不该占着这把锁。
+    if (warn) {
+        ORB_LOG_WARN("memmap: 段表已满（%d 段），此后映射的段不再记录 —— "
+                     "0x%08X+0x%X 起 AG_BpInfo(AG_CADRVALID) 会将其视为未映射，"
+                     "该地址上的断点会静默失效",
+                     static_cast<int>(MemMapStore::kMax), adr, len);
+    }
 }
 
 void MapClear() {
     MemMapStore& m = MemMap();
     EnterCriticalSection(&m.cs);
     m.n = 0;
+    m.dropped = 0;
     LeaveCriticalSection(&m.cs);
 }
 
@@ -210,16 +226,16 @@ bool Mapped(uint32_t adr) {
 // waiting on purpose or wedged - and a silent log is indistinguishable from a
 // crash.  The behaviour is unchanged; only its visibility is.
 struct WaitHeartbeat {
-    DWORD       t0;
-    DWORD       last;
+    uint64_t    t0;
+    uint64_t    last;
     const char* what;
 
     explicit WaitHeartbeat(const char* w)
-        : t0(GetTickCount()), last(t0), what(w) {}
+        : t0(GetTickCount64()), last(t0), what(w) {}
 
     void Tick() {
-        const DWORD now = GetTickCount();
-        if (now - last < 10000) return;
+        const uint64_t now = GetTickCount64();
+        if (now - last < 10000ull) return;
         last = now;
         ORB_LOG_INFO("AGDI: %s still waiting (%u s) - the target has not stopped "
                      "and no stop request has arrived",
@@ -324,10 +340,10 @@ void ComLock::Release() {
 }
 
 ComLockWait::ComLockWait(unsigned timeoutMs) : m_held(false) {
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     for (;;) {
         if (TryEnterCriticalSection(&g_comLock)) { m_held = true; return; }
-        if ((GetTickCount() - t0) >= timeoutMs) return;
+        if ((GetTickCount64() - t0) >= timeoutMs) return;
         Sleep(1);
     }
 }
@@ -1421,22 +1437,20 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
     // what tells the two apart; the measured case is GOTILADR(0x080001E0)
     // returning "stopped at 0x08022F1A" with no stop request in between.
     {
-        char hw[192] = {0};
-        int  n = 0;
+        char   hw[192] = {0};
+        size_t n = 0;
         for (uint32_t comp = 0; comp < 8u; ++comp) {
             uint32_t v = 0;
             if (!c.dap.MemRead32(0xE0002008u + 4u * comp, v)) break;
             if (v == 0u) continue;
-            n += snprintf(hw + n, sizeof(hw) - static_cast<size_t>(n),
-                          " FP_COMP%u=0x%08X", comp, v);
+            orb::fmt::Append(hw, sizeof(hw), n, " FP_COMP%u=0x%08X", comp, v);
         }
         uint32_t addrs[32];
         const int cnt = c.bps.Addresses(addrs, 32);
-        char tb[256] = {0};
-        int  m = 0;
+        char   tb[256] = {0};
+        size_t m = 0;
         for (int i = 0; i < cnt; ++i) {
-            m += snprintf(tb + m, sizeof(tb) - static_cast<size_t>(m),
-                          " 0x%08X", addrs[i]);
+            orb::fmt::Append(tb, sizeof(tb), m, " 0x%08X", addrs[i]);
         }
         ORB_LOG_INFO("Bp: before run - hardware:%s | tracked:%s",
                      n ? hw : " (none)", m ? tb : " (none)");
@@ -1551,7 +1565,7 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
     if (!resumed) {
         rc = AG_RDFAILED;
     } else {
-        const DWORD start = GetTickCount();
+        const uint64_t start = GetTickCount64();
         WaitHeartbeat beat("AG_GOFORBRK");
         for (;;) {
             if (InterlockedCompareExchange(&c.stopReq, 0, 0) != 0) {
@@ -1584,7 +1598,7 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
             }
             if (halted) break;
 
-            if (timeoutMs != 0 && (GetTickCount() - start) >= timeoutMs) {
+            if (timeoutMs != 0 && (GetTickCount64() - start) >= timeoutMs) {
                 ComLockWait lock(200);
                 if (lock.Held() && !c.core.Halt() && rc == AG_OK) {
                     rc = AG_RDFAILED;
@@ -1637,13 +1651,13 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
         uint32_t dhcsr = 0;
         c.dap.MemRead32(kDcbDhcsr, dhcsr);
         c.dap.MemRead32(kDcbDfsr, dfsr);
-        char why[192] = {0};
-        int  w = 0;
-        if (dfsr & 0x01u) w += snprintf(why + w, sizeof(why) - (size_t)w, " HALTED");
-        if (dfsr & 0x02u) w += snprintf(why + w, sizeof(why) - (size_t)w, " BKPT");
-        if (dfsr & 0x04u) w += snprintf(why + w, sizeof(why) - (size_t)w, " DWTTRAP");
-        if (dfsr & 0x08u) w += snprintf(why + w, sizeof(why) - (size_t)w, " VCATCH");
-        if (dfsr & 0x10u) w += snprintf(why + w, sizeof(why) - (size_t)w, " EXTERNAL");
+        char   why[192] = {0};
+        size_t w = 0;
+        if (dfsr & 0x01u) orb::fmt::Append(why, sizeof(why), w, " HALTED");
+        if (dfsr & 0x02u) orb::fmt::Append(why, sizeof(why), w, " BKPT");
+        if (dfsr & 0x04u) orb::fmt::Append(why, sizeof(why), w, " DWTTRAP");
+        if (dfsr & 0x08u) orb::fmt::Append(why, sizeof(why), w, " VCATCH");
+        if (dfsr & 0x10u) orb::fmt::Append(why, sizeof(why), w, " EXTERNAL");
         ORB_LOG_INFO("GoStep: stop cause - DHCSR=0x%08X%s%s%s | DFSR=0x%08X (%s)",
                      dhcsr,
                      (dhcsr & (1u << 19)) ? " LOCKUP" : "",
@@ -1807,14 +1821,14 @@ RITEM kRegItems[] = {
 RgARMCM g_regs;
 bool    g_haveRegs  = false;
 bool    g_installed = false;
-DWORD   g_regsAt    = 0;        // when g_regs was last read from the target
+uint64_t g_regsAt   = 0;        // when g_regs was last read from the target
 
 // (Re)read the whole register file from the target.
 bool RefreshRegs() {
     orb::agdi::Context& c = orb::agdi::Get();
     if (!c.connected) return false;
     g_haveRegs = c.core.ReadRegs(g_regs);
-    g_regsAt   = GetTickCount();
+    g_regsAt   = GetTickCount64();
     return g_haveRegs;
 }
 
@@ -1829,7 +1843,7 @@ bool ReadRegItem(U16 nItem, U32& out) {
     // xPSR = 0x01000000 while the log showed the PC at 0x08001AEE - "the data
     // does not refresh".  The age bound is the safety net for the case where
     // UPR_NORMAL never arrives; it costs one register read per 100 ms.
-    if (!g_haveRegs || (GetTickCount() - g_regsAt) > 100u) {
+    if (!g_haveRegs || (GetTickCount64() - g_regsAt) > 100u) {
         if (!RefreshRegs()) return false;
     }
     if (nItem <= 0x0Fu) { out = g_regs.Rn[nItem]; return true; }

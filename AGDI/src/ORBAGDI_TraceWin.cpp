@@ -642,7 +642,7 @@ bool RetirePush(Chunk* c)
     RetireStart();
     if (!s.rqStarted) return false;          // 线程/事件没起来 ⇒ 调用方同步兜底
 
-    DWORD t0 = 0;
+    uint64_t t0 = 0;
     for (;;) {
         EnterCriticalSection(&s.retireLock);
         if (s.rqCount < kRetireQ) {
@@ -658,8 +658,8 @@ bool RetirePush(Chunk* c)
         // 队列满 ⇒ 等写线程腾出空槽。**官方在这里就是阻塞等待**
         // （`0x100EBAC8` 压 `0x12bc7a14` 调 `[0x10218428]`，没有超时），
         // 只是官方无限等，这里给个上限（见 kRetireWaitMs）。
-        if (!t0) { t0 = GetTickCount(); ++s.rqWaits; }
-        const DWORD waited = GetTickCount() - t0;
+        if (!t0) { t0 = GetTickCount64(); ++s.rqWaits; }
+        const uint64_t waited = GetTickCount64() - t0;
         if (waited >= kRetireWaitMs) {
             s.rqLostChunks++;
             s.rqLostBytes += c->usedBytes - c->headOfs;
@@ -673,7 +673,7 @@ bool RetirePush(Chunk* c)
             }
             return false;
         }
-        WaitForSingleObject(s.rqSpace, kRetireWaitMs - waited);
+        WaitForSingleObject(s.rqSpace, static_cast<DWORD>(kRetireWaitMs - waited));
     }
 }
 
@@ -684,7 +684,7 @@ void RetireDrain()
     Store& s = S();
     if (!s.rqStarted) return;
 
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
     for (;;) {
         EnterCriticalSection(&s.retireLock);
         const bool idle = (s.rqCount == 0) && !s.rqBusy;
@@ -692,7 +692,7 @@ void RetireDrain()
         LeaveCriticalSection(&s.retireLock);
         if (idle) return;
 
-        if (GetTickCount() - t0 > (kRetireWaitMs * 4)) {
+        if (GetTickCount64() - t0 > (kRetireWaitMs * 4)) {
             ORB_LOG_WARN("TraceWin: 等落盘写线程超时（队列还剩 %u 块）—— 不再等",
                          left);
             return;
@@ -2086,7 +2086,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
 
     // 计时。**这条函数跑在 uVision 的 UI 线程上** —— 它慢多少，界面就卡多少。
     // 拖动时间轴会连打几十次查询，所以这里必须有可量化的证据（见收尾处的 WARN）。
-    const DWORD t0 = GetTickCount();
+    const uint64_t t0 = GetTickCount64();
 
     // 内存为空**不再直接判 EMPTY**：记录日志（P2-2）里可能还有整段历史。
     // `ReplayRecordsFromFile` 会自己判断"文件里有没有这一段"。
@@ -2179,7 +2179,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
                 ORB_LOG_INFO("TraceWin: [0] 只问条数 —— 索引快路 %u ms，区间 [%llu, %llu] "
                              "⇒ %llu 条（块索引 %u 块，内存 %llu 条；同一条数走老路要"
                              "逐条解整段）",
-                             (unsigned)(GetTickCount() - t0),
+                             (unsigned)(GetTickCount64() - t0),
                              (unsigned long long)lo, (unsigned long long)hi,
                              (unsigned long long)n, s.idxCount,
                              (unsigned long long)s.count);
@@ -2414,8 +2414,8 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
 
     // 慢查询告警。阈值 50 ms：拖动时间轴时 uVision 会连打几十次，一次 50 ms 就是
     // 肉眼可见的顿；而正常一次（窄区间、检查点定位）应该在个位数毫秒。
-    const DWORD ms = GetTickCount() - t0;
-    if (ms >= 50) {
+    const uint64_t ms = GetTickCount64() - t0;
+    if (ms >= 50u) {
         // ⚠ `命中` 的含义自 P4-3 起变了：缓冲一满就**立刻停**（不再把当前块解完），
         //   所以满的时候它是"至少这么多"（打印成 `4096+`），不再是区间内的真实总数。
         //   真实总数只有"只问数量"（上限 0）那次才数得出来。
@@ -3867,8 +3867,10 @@ void TraceWinStatusText(const char* text)
 
 // 官方 `OutTraceMsg`（DbgCM/AGDI.CPP:713-743）：把一条消息码渲染成文本并投递。
 //
-// 与官方唯一的形式差异：缓冲区拷贝用 `memcpy` / `sprintf_s` 而不是 `strncpy_s`
-// + `sprintf`，因为本工程的编译选项把不安全 CRT 标为错误。逻辑与分支完全一致。
+// 与官方唯一的形式差异：缓冲区拷贝用 `memcpy` / `orb::fmt::Append` 而不是
+// `strncpy_s` + `sprintf`，因为本工程的编译选项把不安全 CRT 标为错误；
+// 且 `sprintf_s` 在截断时会走 invalid parameter handler（/MT 下等于终止宿主）。
+// 逻辑与分支完全一致。
 static void PublishStatusMsg(unsigned msg)
 {
     if (msg >= kTraceMsgCount) return;
@@ -3876,9 +3878,9 @@ static void PublishStatusMsg(unsigned msg)
     struct bom* bom = orb::pdsc::Bom();
     if (!bom || !bom->Notify || !bom->hwnd || !bom->hmsg) return;
 
-    char buf[128];
-    int  n      = 0;
-    int  clrLen = 0;
+    char   buf[128] = {0};
+    size_t n      = 0;
+    int    clrLen = 0;
 
     if (g_traceOpt & kTraceEnable) {
         if (bom->bSecureExt && msg != 0) {
@@ -3887,19 +3889,19 @@ static void PublishStatusMsg(unsigned msg)
             if (sscanf_s(kTraceMsg[msg], "\\<!clr%c>", &clr, 1) == 1) {
                 clrLen = static_cast<int>(strlen("\\<!clrx>"));
                 memcpy(&buf[n], kTraceMsg[msg], clrLen);
-                n += clrLen;
+                n = static_cast<size_t>(clrLen);
             }
             if (bom->bSTrcEna) {
-                n += sprintf_s(&buf[n], sizeof(buf) - n, "Secure ");
+                orb::fmt::Append(buf, sizeof(buf), n, "Secure ");
                 g_tSecure = true;
             } else {
-                n += sprintf_s(&buf[n], sizeof(buf) - n, "Non-Secure ");
+                orb::fmt::Append(buf, sizeof(buf), n, "Non-Secure ");
                 g_tSecure = false;
             }
         }
     }
 
-    sprintf_s(&buf[n], sizeof(buf) - n, "%s", kTraceMsg[msg] + clrLen);
+    orb::fmt::Append(buf, sizeof(buf), n, "%s", kTraceMsg[msg] + clrLen);
     bom->Notify(UV_RTAH_ERRMSG, buf);
 }
 
@@ -4028,12 +4030,12 @@ void TraceWinRead(unsigned timeMs, bool ts)
     if (!(g_traceOpt & kTraceEnable)) return;
 
     if (timeMs) {
-        const DWORD tick = GetTickCount();
+        const uint64_t tick = GetTickCount64();
         do {
             // 官方在取数循环里折叠通信错误与硬件缓冲溢出。
             FoldErr(kTErrHwCom, kTMsgComErr);
             FoldErr(kTErrHwBuf, kTMsgHwBuf);
-        } while ((GetTickCount() - tick) < timeMs);
+        } while ((GetTickCount64() - tick) < timeMs);
 
         // 失去同步看门狗（:2040-2046）。官方无条件跑；本驱动在 SyncPeriod 未知时
         // （没有权威核心时钟，bug.md §R6）跳过——否则第一轮就会报一个假的

@@ -119,7 +119,7 @@ bool TraceDrainWanted()
 //   所以 P0-A 的"无流式源就不拿探针锁"（`skipBusy == 0`）不受影响；只有真出过错才去
 //   探测，而那时用户的窗口本来就是坏的，占一下锁是应该的。
 const DWORD kAccCheckMs = 100u;
-DWORD       s_lastAccCheck = 0;
+uint64_t    s_lastAccCheck = 0;
 
 void MaybeRecoverAccess()
 {
@@ -129,7 +129,7 @@ void MaybeRecoverAccess()
     if (InterlockedCompareExchange(&c.uninitReq, 0, 0) != 0) return;
     if (!c.dap.AccessSuspect() && dbgAccLevel == kAccNormal) return;
 
-    const DWORD now = GetTickCount();
+    const uint64_t now = GetTickCount64();
     if ((now - s_lastAccCheck) < kAccCheckMs) return;
 
     // 拿不到探针锁就让下一轮 —— 调试线程在用探针时本来也不该插进去。
@@ -214,11 +214,11 @@ unsigned __stdcall Body(void*)
             continue;
         }
 
-        const DWORD t0 = GetTickCount();
+        const uint64_t t0 = GetTickCount64();
         for (;;) {
             if (InterlockedCompareExchange(&s_stop, 0, 0) != 0) break;
             if (TracePumpSuspended()) break;
-            if ((GetTickCount() - t0) >= kBudgetMs) break;        // 预算用完
+            if ((GetTickCount64() - t0) >= kBudgetMs) break;        // 预算用完
 
             // 非阻塞地拿探针锁；拿不到 = 调试线程在用探针。
             // **拿不到不能把整轮扔掉**：调试线程的运行循环每 1 ms 采一次

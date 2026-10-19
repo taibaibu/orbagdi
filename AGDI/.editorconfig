@@ -1,3 +1,7 @@
+# charset 必须与实况一致：全部源文件都是**无 BOM 的 UTF-8**（cl 用 /utf-8
+# 读，所以非 ASCII 注释与字符串字面量都正常）。写成 utf-8-bom 会让编辑器给
+# 新文件加 BOM，而某些编辑器一仍按 GBK 保存旧文件就会把 rb 里的中文提示变成
+# 乱码 —— 那是用户可见的文本，属于静默故障。
 [*]
-charset = utf-8-bom
+charset = utf-8
 end_of_line = crlf
