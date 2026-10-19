@@ -1,0 +1,81 @@
+# ORBAGDI / AGDI 驱动的 CI：只做一件事 —— 确认代码在干净的 Windows 上能编出
+# ORB_AGDI.dll。
+#
+# 为什么不 setup-msbuild / 进开发者命令行：AGDI\build.ps1 自己用 vswhere 找 VS、
+# 从注册表找 Windows SDK，并显式拼 INCLUDE/LIB（见脚本 "Locate the toolchain"），
+# 所以只要 runner 上装了 x86 C++ 工具集就够了。
+#
+# 不跑 AGDI\test\ 下的脚本：inspect_sheet / e2e_sheet / trace_stream 那些要
+# uVision + 真实探针，runner 上两样都没有。
+#
+# capstone.lib 是**入库**的（AGDI\capstone\lib\capstone.lib，约 10 MB），所以这里
+# 不需要先跑 capstone\build.ps1 —— 那个脚本要从 PyPI 拉 sdist 再编 79 个 .c。
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: x86 Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 先单独探一次工具链：build.ps1 的失败信息是一行 "*** Visual Studio with
+      # C++ toolset not found."，看不出是 runner 镜像换了还是脚本找错地方。
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+          $vs = & $vswhere -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                  -property installationPath
+          if (-not $vs) { throw 'no Visual Studio install with the x86 C++ toolset' }
+          $vs = $vs.Trim()
+          "VS   : $vs"
+          Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+            ForEach-Object { "MSVC : $($_.Name)" }
+          "SDK  : " + (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' `
+                        -ErrorAction SilentlyContinue).KitsRoot10
+
+      # -Force：干净 checkout 本来就是全量，但这样连时间戳的偶然性也一并排除。
+      # 脚本失败走 exit 1（它刻意不用 throw，理由见脚本头注释），因此这一步
+      # 直接红，不需要再检查 $LASTEXITCODE。
+      - name: Build
+        shell: pwsh
+        working-directory: AGDI
+        run: ./build.ps1 -Force
+
+      # build.ps1 唯一没做的事就是"确认产物真的在"——它 exit 0 而 bin\ 空着的
+      # 情况目前不可能，但让 CI 把它说清楚，比事后怀疑 CI 有没有跑值当。
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $dll = 'AGDI/bin/ORB_AGDI.dll'
+          if (-not (Test-Path $dll)) { throw "build.ps1 exited 0 but $dll is missing" }
+          Get-Item $dll | ForEach-Object { '{0}  {1:N0} bytes' -f $_.Name, $_.Length }
+          'sha256 ' + (Get-FileHash $dll -Algorithm SHA256).Hash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ORB_AGDI-x86
+          path: |
+            AGDI/bin/ORB_AGDI.dll
+            AGDI/bin/ORB_AGDI.pdb
+          if-no-files-found: error
+          retention-days: 30

@@ -1,4 +1,3 @@
----
 # ORBAGDI
 
 An open CMSIS-DAP AGDI target driver for Keil uVision / µVision (MDK).
@@ -6,7 +5,7 @@ An open CMSIS-DAP AGDI target driver for Keil uVision / µVision (MDK).
 uVision loads **AGDI** ("ARM Generic Debug Interface") DLLs as target drivers.
 This project builds `ORB_AGDI.dll`, an AGDI driver for CMSIS-DAP probes that
 talks to the probe through the **RDDI** host interface (`CMSIS_DAP.dll`, the
-same interface elaphureLink and Keil's own driver use).
+same interface ElaphureLink and Keil's own driver use).
 
 * Build product: `bin\ORB_AGDI.dll` (32-bit, `/MT` static CRT)
 * Deployed as: `<Keil>\ARM\BIN\ORB_AGDI.dll`
@@ -19,7 +18,7 @@ same interface elaphureLink and Keil's own driver use).
 
 ## 1. Build
 
-```
+```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
@@ -45,7 +44,7 @@ reference implementations kept for study and are **not** part of the build.
 
 Copy `bin\ORB_AGDI.dll` to
 
-```
+```text
 <Keil>\ARM\BIN\ORB_AGDI.dll
 ```
 
@@ -62,7 +61,8 @@ is `TDRV21`:
 
 ```ini
 [ARM]
-PATH="D:\MDK5\ARM\"                            # BIN\ below is relative to this
+; BIN\ below is relative to this PATH
+PATH="D:\MDK5\ARM\"
 TDRV21=BIN\ORB_AGDI.dll("ORBTRACE Debugger")
 ```
 
@@ -78,7 +78,8 @@ Debug dropdown. A `TDRV` that is registered but missing from the matching
 is `CPUDLL1`:
 
 ```ini
-CPUDLL1=SARMCM3.DLL(TDRV1,…,TDRV16,TDRV21)     # Cortex-M devices
+; Cortex-M devices
+CPUDLL1=SARMCM3.DLL(TDRV1,…,TDRV16,TDRV21)
 ```
 
 `CPUDLL3=SARMV8M.DLL(…)` is the ARMv8-M list and is deliberately left alone —
