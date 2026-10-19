@@ -74,6 +74,18 @@ private:
 bool Connect();
 void Disconnect();
 
+// ---------------------------------------------------------------------------
+// 运行期收掉 trace 源（设置页把 Trace Enable 取消勾选之后）
+// ---------------------------------------------------------------------------
+// `cfg::ReadTrace()` 改的是全局配置，而三个源的运行状态机（OrbTrace / ITM /
+// TracePump 的 `TraceDrainWanted()`）只看状态、**不看配置**。所以"设置页里关掉
+// 开关"必须显式收尾一次，否则源继续跑、worker 继续每 2 ms 抢探针锁抽数，而调试
+// 线程用的是非阻塞 ComLock（拿不到就报 probe busy）—— 表现正好是"把 trace 关了，
+// 调试反而更卡"。
+//
+// 会话不在时什么都不做。返回 true 表示确实停掉了正在跑的源。
+bool StopTraceSources(const char* why);
+
 // Called from DllMain(DLL_PROCESS_DETACH).
 void Shutdown();
 

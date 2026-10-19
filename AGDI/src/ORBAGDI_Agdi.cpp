@@ -1038,6 +1038,49 @@ bool Connect() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 运行期收掉 trace 源（设置页取消 Trace Enable）
+// ---------------------------------------------------------------------------
+// 为什么不能只改配置：`TraceDrainWanted()` 是 `ItmActive() || OrbTraceActive()`，
+// 只看状态机、不看 `cfg`。设置页把 `traceEnable` 写成 0 之后，源照旧在跑，worker
+// 照旧每 2 ms 抢探针锁抽数 —— 调试线程的 `AG_AllReg` / `AG_DapAcc` / `AG_GoStep`
+// 用的是非阻塞 ComLock，拿不到就报 probe busy，用户看到的就是"关了 trace 还卡"。
+//
+// 顺序与 `Disconnect()` 一致：先让窗口/状态栏归零，再停源，最后关目标侧硬件。
+// **worker 不停** —— 它还兼着后台访问恢复（`MaybeRecoverAccess()`）；源停掉之后
+// 它自己会因为 `TraceDrainWanted()` 为假而空转，不再碰锁。
+bool StopTraceSources(const char* why) {
+    Context& c = Get();
+    if (!c.connected) return false;
+
+    const bool streaming = OrbTraceActive() || ItmActive();
+    const bool etbArmed  = EtbAvailable() && EtbGetStatus().configured;
+    if (!streaming && !etbArmed) return false;
+
+    ORB_LOG_INFO("Trace: 收掉运行中的 trace 源（%s）orbtrace=%d itm=%d etb=%d",
+                 why ? why : "?", (int)OrbTraceActive(), (int)ItmActive(),
+                 (int)etbArmed);
+
+    // 停源要碰探针。拿不到锁就不硬来：断开那一路会无条件收尾，而且此时硬等只会
+    // 让设置页按钮看起来卡住。
+    ComLockWait lock(500);
+    if (!lock.Held()) {
+        ORB_LOG_WARN("Trace: 收源时拿不到探针锁（%s），留待 Disconnect 收尾",
+                     why ? why : "?");
+        return false;
+    }
+
+    // 状态通知放在**拿到锁之后**：拿不到锁时干脆别动窗口，否则会留下"窗口说已
+    // 停止、源还在跑"的半截状态，而下次 Connect 之前没人能纠正它。
+    TraceSetRunning(false, true);
+    OrbTraceStop(c.dap);
+    ItmStop(c.dap);
+    // 目标侧那一半同样要关：只停主机侧的抽取，ETM 仍在全速灌，没人排空就溢出。
+    ItmTraceOff(c.dap);
+    if (EtbAvailable()) EtbReset();
+    return true;
+}
+
 void Disconnect() {
     Context& c = Get();
     if (!c.connected) return;

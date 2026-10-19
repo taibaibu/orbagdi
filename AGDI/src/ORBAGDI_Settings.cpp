@@ -60,6 +60,8 @@
 // Power 页：档位表与 `OrbPowerApply` / `OrbPowerAllOff` / `OrbPowerGet` 都在那里。
 // 档位表只有那一份 —— 界面从它现取，不在这里再抄一遍。
 #include "ORBAGDI_Power.h"
+// 运行期收 trace 源：Trace Enable 一关就必须显式停一次，见 `Accept()` 里的说明。
+#include "ORBAGDI_Agdi.h"
 
 namespace orb {
 namespace cfg {
@@ -2742,6 +2744,14 @@ bool Accept(SheetCtx* ctx) {
     if (!ReadFlash(ctx, ctx->hPage[kPageFlash], c)) return false;
     if (!ReadPack (ctx, ctx->hPage[kPagePack], c)) return false;
     if (!ReadRecord(ctx, ctx->hPage[kPageRecord], c)) return false;
+
+    // Trace Enable 一关就**当场**收源，不能等下一次 Connect。
+    //
+    // `ReadTrace()` 只是把 `traceEnable` / 三个源写进全局配置，而运行中的状态机
+    // 不读配置：OrbTrace / ITM 还在跑，TracePump 的 `TraceDrainWanted()` 仍为真，
+    // worker 继续每 2 ms 抢探针锁抽数 —— 调试线程的非阻塞 ComLock 拿不到就报
+    // probe busy，表现就是"取消勾选 trace 之后调试反而更卡"。
+    if (!c.traceEnable) orb::agdi::StopTraceSources("settings: trace disabled");
 
     Format(ctx->out, ctx->outCch);
     ctx->ok = true;
