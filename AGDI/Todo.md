@@ -318,6 +318,13 @@ Trace 页使能打开；目标**跑 ≥ 10 s**。
       的地址都页对齐、长度不超过页大小，且校验通过；② `CheckSectorTable` 是否误拒真实 FLM
       （第 4 条比 Keil 严；被拒时该**放宽**而不是硬擦）；③ `Flash → Erase` 与 `Flash → Run` 在 uVision
       里的实际调用形态。
+- [ ] **设置页探测要不要碰"正在跑"的探针**（取舍待裁定，2026-10-19）：现在打开设置页、以及每次
+      切 Debug 页的 Interface 下拉，都会 `RDDI_Open` + `CMSIS_DAP_Connect` 真建一次链路
+      （`ProbeAps()`，见 `ORBAGDI_Settings.cpp` 的 `ReprobeForIface()`）。若此时已有调试会话在跑
+      （`rddi::IsLoaded()` 为真），等于对**同一根正在使用的**探针再 Connect 一次。拟议：会话中
+      只列接口、AP 退回未探测的 0..3，整段探测跳过。判据：会话中打开设置页，日志**不出现**新的
+      `Cfg: target linked over …`，且 Trace / 寄存器窗口不被打断；代价是此时 AP 下拉只剩索引号
+      （用户可能误以为"没刷新"）。
 
 ## 6. 待测试（已实现，但没有实机无法确认）
 

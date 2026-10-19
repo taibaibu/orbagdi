@@ -1051,45 +1051,103 @@ bool FieldRead(SheetCtx* ctx, HWND p, Config& c, const Field* f, int n) {
 // ---------------------------------------------------------------------------
 // Probing the bench through the RDDI layer
 // ---------------------------------------------------------------------------
+/// 一次探测会话 —— 设置页唯一允许的"碰探针"方式，由析构函数负责拆干净。
+///
+/// 为什么要有这个类型：`Dap::Disconnect()` 已经记过这个坑 —— 只 `RDDI_Close`
+/// **只还了句柄，链路没拆**。`CMSIS_DAP_ConfigureInterface` 会锁住传输层，
+/// `CMSIS_DAP_Connect` 会建立 SWD/JTAG 链路；链路不拆，探针的 DAP 接口就一直
+/// 留在 connected 状态，USB 端也一直被占着 —— 设置页关掉之后照样占。
+/// 文档里的拆法是 `DAP_Disconnect` **然后** `RDDI_Close`（ORBMDK `Usage.md` §2）。
+///
+/// `ProbeInterfaces()` 与 `ProbeAps()` 原来各自手写一遍 Open/Close，两处都只抄了
+/// 后半段。收进析构函数以后，每条提前 `return false` 的路都会拆干净，新加的
+/// 探针也不会因为照着抄一半而漏掉。
+class ProbeSession {
+public:
+    ProbeSession() = default;
+    ~ProbeSession() { Close(); }
+    ProbeSession(const ProbeSession&) = delete;
+    ProbeSession& operator=(const ProbeSession&) = delete;
+
+    /// Loads the host when nobody else has it loaded, then opens a session.
+    bool Open() {
+        m_loadedByUs = !rddi::IsLoaded();
+        if (m_loadedByUs && !rddi::Load()) return false;
+        const rddi::Api& api = rddi::Get();
+        if (!api.Open || api.Open(&m_h, nullptr) != 0 || m_h == 0) {
+            Close();
+            return false;
+        }
+        return true;
+    }
+
+    /// 配置传输层并建立链路。定义在 `ConfigureSession()` 之后 —— 就是它调用的。
+    bool Link(int iface, int port);
+
+    RDDIHandle handle() const { return m_h; }
+
+    void Close() {
+        if (m_closed) return;
+        m_closed = true;
+
+        if (m_h) {
+            const rddi::Api& api = rddi::Get();
+            // 两件都做，顺序照文档。`m_touched` 是 `Link()` 在动手**之前**置的：
+            // `CMSIS_DAP_ConfigureInterface` 自己就会锁传输层，所以 Connect 失败
+            // 也得拆（同 `Dap::Disconnect()` 的注释）。
+            if (m_touched && api.DAP_Disconnect) api.DAP_Disconnect(m_h);
+            if (api.Close) api.Close(m_h);
+            m_h = 0;
+        }
+        m_touched = false;
+        if (m_loadedByUs) rddi::Unload();
+        m_loadedByUs = false;
+    }
+
+private:
+    RDDIHandle m_h          = 0;
+    bool       m_loadedByUs = false;   // 宿主是这次探测加载的 -> 结束时要卸载
+    bool       m_touched    = false;   // 已经动过传输层 -> 必须先 DAP_Disconnect
+    bool       m_closed     = false;
+};
+
 /// Enumerates the CMSIS-DAP interfaces the RDDI host can see, then identifies
 /// each one.  The RDDI module is loaded only when it is not loaded already (a
-/// live session keeps its own), and the temporary handle is closed again, so
-/// nothing is left behind for the session to trip over.
+/// live session keeps its own), and the temporary session is torn down by
+/// `ProbeSession`, so nothing is left behind for the session to trip over.
 bool ProbeInterfaces(std::vector<IfaceInfo>& out) {
     out.clear();
-    const bool wasLoaded = rddi::IsLoaded();
-    if (!wasLoaded && !rddi::Load()) return false;
+
+    ProbeSession s;
+    if (!s.Open()) return false;
 
     const rddi::Api& api = rddi::Get();
-    RDDIHandle h = 0;
-    bool ok = false;
-    if (api.Open && api.Open(&h, nullptr) == 0 && h != 0) {
-        int numIf = 0;
-        if (api.CMSIS_DAP_Detect && api.CMSIS_DAP_Detect(h, &numIf) == 0 && numIf > 0) {
-            for (int i = 0; i < numIf; ++i) {
-                IfaceInfo f;
-                f.index = i;
-                // idNo: 1 = vendor, 2 = product (the name Keil shows),
-                //       3 = serial, 4 = firmware version.
-                for (int idNo = 1; api.CMSIS_DAP_Identify && idNo <= 4; ++idNo) {
-                    char buf[256];
-                    memset(buf, 0, sizeof(buf));
-                    if (api.CMSIS_DAP_Identify(h, i, idNo, buf, sizeof(buf)) != 0) continue;
-                    switch (idNo) {
-                    case 1: f.vendor = Widen(buf); break;
-                    case 2: f.name   = Widen(buf); break;
-                    case 3: f.serial = Widen(buf); break;
-                    default: f.fw    = Widen(buf); break;
-                    }
-                }
-                out.push_back(f);
-            }
-            ok = !out.empty();
-        }
-        if (api.Close) api.Close(h);
+    int numIf = 0;
+    if (!api.CMSIS_DAP_Detect || api.CMSIS_DAP_Detect(s.handle(), &numIf) != 0 ||
+        numIf <= 0) {
+        return false;
     }
-    if (!wasLoaded) rddi::Unload();
-    return ok;
+
+    const RDDIHandle h = s.handle();
+    for (int i = 0; i < numIf; ++i) {
+        IfaceInfo f;
+        f.index = i;
+        // idNo: 1 = vendor, 2 = product (the name Keil shows),
+        //       3 = serial, 4 = firmware version.
+        for (int idNo = 1; api.CMSIS_DAP_Identify && idNo <= 4; ++idNo) {
+            char buf[256];
+            memset(buf, 0, sizeof(buf));
+            if (api.CMSIS_DAP_Identify(h, i, idNo, buf, sizeof(buf)) != 0) continue;
+            switch (idNo) {
+            case 1: f.vendor = Widen(buf); break;
+            case 2: f.name   = Widen(buf); break;
+            case 3: f.serial = Widen(buf); break;
+            default: f.fw    = Widen(buf); break;
+            }
+        }
+        out.push_back(f);
+    }
+    return !out.empty();
 }
 
 /// Brings the session up to the point where the DP answers, following the order
@@ -1117,16 +1175,20 @@ bool ProbeInterfaces(std::vector<IfaceInfo>& out) {
 /// it *after* Connect, and re-timing a session that is already running is exactly
 /// what this probe promises not to do.
 ///
+/// `iface` / `port` are what the caller wants probed, **not** what the saved
+/// config says.  The settings sheet calls this from a combo handler, where the
+/// saved value is still the old one (OK has not been pressed yet) - which is
+/// exactly why the AP list used to look frozen when the adapter was changed.
+///
 /// Returns true when the target answered.
-bool ConfigureSession(RDDIHandle h) {
+bool ConfigureSession(RDDIHandle h, int iface, int port) {
     const rddi::Api& api = rddi::Get();
     if (!api.CMSIS_DAP_Detect || !api.CMSIS_DAP_ConfigureInterface) return false;
 
     int numIf = 0;
     if (api.CMSIS_DAP_Detect(h, &numIf) != 0 || numIf <= 0) return false;
 
-    const Config& c = Get();
-    const int useIf = (c.iface >= 0 && c.iface < numIf) ? c.iface : 0;
+    const int useIf = (iface >= 0 && iface < numIf) ? iface : 0;
 
     char cfgStr[64];
     char* cfgArg = rddi::InterfaceConfig(cfgStr, sizeof(cfgStr));
@@ -1140,7 +1202,7 @@ bool ConfigureSession(RDDIHandle h) {
     }
 
     if (api.DAP_Configure) {
-        api.DAP_Configure(h, (c.port == kPortJtag) ? "JTAG" : "SWD");
+        api.DAP_Configure(h, (port == kPortJtag) ? "JTAG" : "SWD");
     }
 
     // ARM's rddi_dap.h order: both DAP list calls come before Connect.
@@ -1157,15 +1219,23 @@ bool ConfigureSession(RDDIHandle h) {
                      "cannot be linked and the AP list stays unprobed");
         return false;
     }
-    int iface = 0;
-    const int rc = api.CMSIS_DAP_Connect(h, &iface);
+    int linked = 0;
+    const int rc = api.CMSIS_DAP_Connect(h, &linked);
     if (rc != 0) {
         ORB_LOG_WARN("Cfg: CMSIS_DAP_Connect failed (rc=%d) - no target on the "
                      "port, or the target is not powered", rc);
         return false;
     }
-    ORB_LOG_INFO("Cfg: target linked over %s", (iface == 2) ? "JTAG" : "SWD");
+    ORB_LOG_INFO("Cfg: target linked over %s", (linked == 2) ? "JTAG" : "SWD");
     return true;
+}
+
+/// 一次"配置 + 建链"。`m_touched` 在动手**之前**置起：`ConfigureInterface` 自己
+/// 就会锁住传输层，所以即使 Connect 失败，析构时也必须 `DAP_Disconnect`。
+bool ProbeSession::Link(int iface, int port) {
+    if (!m_h) return false;
+    m_touched = true;
+    return ConfigureSession(m_h, iface, port);
 }
 
 /// Names an AP from its IDR, using the field layout Keil's own CoreSight tables
@@ -1197,26 +1267,28 @@ const wchar_t* ApClassName(uint32_t idr) {
 /// Reads the IDR of every AP index the DP answers on, so the AP combo can show
 /// "<index>: AHB-AP (0x24770011)" instead of a bare number.
 ///
+/// `iface` / `port` name the adapter and port to probe.  There is deliberately no
+/// "read them from the config" default: the sheet calls this from the Interface
+/// combo handler too, where the saved config still holds the *previous* adapter.
+///
 /// This deliberately does NOT touch nRESET or the SWJ clock: opening a settings
 /// sheet must never reset a target or re-time a live session.  It powers up the
 /// debug domain and reads registers, which is what any debugger does anyway, and
 /// it gives up quietly when no target answers - the sheet then offers the plain
 /// 0..3 list.
-bool ProbeAps(std::vector<ApInfo>& out) {
+bool ProbeAps(std::vector<ApInfo>& out, int iface, int port) {
     out.clear();
-    const bool wasLoaded = rddi::IsLoaded();
-    if (!wasLoaded && !rddi::Load()) return false;
+
+    ProbeSession s;
+    if (!s.Open()) return false;
 
     const rddi::Api& api = rddi::Get();
-    if (!api.Open || !api.DAP_ReadReg || !api.DAP_WriteReg) {
-        if (!wasLoaded) rddi::Unload();
-        return false;
-    }
+    if (!api.DAP_ReadReg || !api.DAP_WriteReg) return false;
 
-    RDDIHandle h = 0;
+    const RDDIHandle h = s.handle();
     bool ok = false;
-    if (api.Open(&h, nullptr) == 0 && h != 0) {
-        ConfigureSession(h);
+    {
+        s.Link(iface, port);
 
         int idcode = 0;
         const bool dpAlive =
@@ -1246,9 +1318,7 @@ bool ProbeAps(std::vector<ApInfo>& out) {
             }
             ok = !out.empty();
         }
-        if (api.Close) api.Close(h);
     }
-    if (!wasLoaded) rddi::Unload();
     return ok;
 }
 
@@ -1903,6 +1973,56 @@ void ShowIfaceInfo(SheetCtx* ctx, HWND p) {
 void UpdatePortEnable(HWND p, int portSel) {
     const bool swd = (portSel != 1);        // 0 = SWD (default), 1 = JTAG
     EnableWindow(GetDlgItem(p, kIdChkSwj), swd);
+}
+
+/// Re-probes the AP list for the interface the combo now points at.
+///
+/// 为什么必须重探：AP 列表是**这个 adapter + 这个 port** 的属性，不是全局的。
+/// 而且新接口必须**传进去** —— `ProbeAps()` / `ConfigureSession()` 现在不再从
+/// 已保存的配置里读 `iface`（那时它还是旧值，OK 还没按），否则重探出来的仍是
+/// 旧 adapter 的 AP，下拉看着就像"没刷新"。
+///
+/// 探测是同步的：枚举 USB、Connect、读 8 个 APIDR，慢的时候几百毫秒。所以期间
+/// 把这一组灰掉并写一行 "(probing...)"，否则用户会以为界面卡死，再多点几下下拉。
+void ReprobeForIface(SheetCtx* ctx) {
+    HWND p = ctx->hPage[kPageDebug];
+    if (!p) return;
+
+    ShowIfaceInfo(ctx, p);
+
+    const int iface  = IfaceValue(ctx, p);
+    const int port   = (ComboSel(p, kIdCmbPort, 0) == 1) ? kPortJtag : kPortSwd;
+    const int keepAp = ApValue(ctx, p);
+
+    const WORD busy[] = { kIdCmbIface, kIdCmbAp, kIdCmbPort, kIdChkSwj };
+    for (const WORD id : busy) EnableWindow(GetDlgItem(p, id), FALSE);
+    SetDlgItemTextW(p, kIdValSerial, L"(probing...)");
+    UpdateWindow(p);
+
+    std::vector<ApInfo> aps;
+    if (ProbeAps(aps, iface, port)) {
+        ctx->aps.swap(aps);
+        Report(ctx, "RDDI: the selected interface answered the AP probe (%u AP(s)).",
+               static_cast<unsigned>(ctx->aps.size()));
+    } else {
+        // 目标没回答就退回 0..3，并且**保留原来那个索引** —— 与建页时同一套
+        // 做法，否则改一次 adapter 就把 AP 选择悄悄丢了。
+        ApFallback(ctx->aps);
+        bool have = false;
+        for (const ApInfo& a : ctx->aps) {
+            if (a.index == keepAp) { have = true; break; }
+        }
+        if (!have) { ApInfo a; a.index = keepAp; ctx->aps.push_back(a); }
+        Report(ctx, "RDDI: the selected interface did not answer the AP probe - "
+                    "AP 0..3 are offered unprobed.");
+    }
+
+    FillApCombo(ctx, p, keepAp);
+    ShowIfaceInfo(ctx, p);
+
+    for (const WORD id : busy) EnableWindow(GetDlgItem(p, id), TRUE);
+    // `SWJ-DP` 的可用性由 Port 决定，不是无条件恢复。
+    UpdatePortEnable(p, ComboSel(p, kIdCmbPort, 0));
 }
 
 /// Greys what the chosen source does not use, and everything below the master
@@ -2765,7 +2885,7 @@ INT_PTR CALLBACK SheetProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
             if (!have) { IfaceInfo f; f.index = c.iface; ctx->ifaces.push_back(f); }
         }
 
-        if (ProbeAps(ctx->aps)) {
+        if (ProbeAps(ctx->aps, c.iface, c.port)) {
             Report(ctx, "RDDI: %u AP(s) answered the IDR probe.",
                    static_cast<unsigned>(ctx->aps.size()));
         } else {
@@ -2879,9 +2999,10 @@ INT_PTR CALLBACK SheetProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return TRUE;
 
-        // ... and the interface combo decides whose identity is shown.
+        // 选 adapter 不只是换一行身份回显：AP 列表是**这个 adapter** 的属性，
+        // 必须按新接口重探一次（见 ReprobeForIface）。
         case kIdCmbIface:
-            if (HIWORD(wp) == CBN_SELCHANGE) ShowIfaceInfo(ctx, ctx->hPage[kPageDebug]);
+            if (HIWORD(wp) == CBN_SELCHANGE) ReprobeForIface(ctx);
             return TRUE;
 
         // ... and the port combo decides whether SWJ-DP applies at all.
