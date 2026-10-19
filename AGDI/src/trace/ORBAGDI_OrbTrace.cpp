@@ -48,6 +48,11 @@ struct State {
     unsigned long long lastBadSum;
     unsigned long long lastCobsErrors;
 
+    // 本次开流时 BytesIn() 的值。解帧器的计数与"出错帧绝对偏移"都是跨会话累计
+    // 的（Reset() 刻意保留统计），日志要报的是**本次会话**里第几个字节出错，
+    // 所以减去这个基准。
+    unsigned long long errBase;
+
     // 上一次看到的 RDDI 环丢帧字节数。一变就置 `T_ERR_DATA_OVF`
     // （= 官方的 "Data Overflow"）。
     unsigned long long lastDropped;
@@ -76,8 +81,8 @@ struct State {
     // 4.5e17 的 ITM 条数），只有 OrbTraceStart() 走过才会被清零。
     State() : active(false), oflow(true), handle(0), stats(), logged(false),
               sawData(false), reads(0), noData(0), errors(0), framesLogged(0),
-              lastBadSum(0), lastCobsErrors(0), lastDropped(0), writeTicks(0),
-              resyncReq(0)
+              lastBadSum(0), lastCobsErrors(0), errBase(0), lastDropped(0),
+              writeTicks(0), resyncReq(0)
     {
         memset(tagBytes,  0, sizeof(tagBytes));
         memset(tagFrames, 0, sizeof(tagFrames));
@@ -182,6 +187,9 @@ void ProcessBytes(const uint8_t* data, unsigned n)
     // 此刻引擎状态才归本线程所有，直接改会和正在跑的 ProcessBytes 撞。
     if (InterlockedExchange(&s.resyncReq, 0) != 0) {
         EtmTraceForceSync(false);
+        // 缺口之后解帧器自己也是错位的：让它丢到下一个 0x00 再开始，
+        // 否则它会带着半帧继续解，把"下一次对齐"变成又一条 COBS 错。
+        s.deframer.DropToDelimiter();
     }
 
     // cache（P2-1）：orbtrace 交出来的就是 OFLOW 帧（tag + payload + sum，COBS 编码），原样写入
@@ -195,6 +203,10 @@ void ProcessBytes(const uint8_t* data, unsigned n)
         ORB_LOG_INFO("orbtrace: 收到第一批 trace 数据 (%u 字节, oflow=%d)",
                      n, s.oflow ? 1 : 0);
     }
+
+    // 本块在"本次会话字节流"里的起点（Pump 之前取，Pump 会加 n）。报错时用它把
+    // 出错帧的绝对偏移换算成块内下标，才能把现场那几个字节打出来。
+    const unsigned long long blkBase = s.deframer.BytesIn() - s.errBase;
 
     if (s.oflow) {
             // ⚠ 切片推进，不能一次 Pump 整块（实测一块 64 KB）。
@@ -215,8 +227,43 @@ void ProcessBytes(const uint8_t* data, unsigned n)
             const unsigned long long bs = s.deframer.BadSum();
             const unsigned long long ce = s.deframer.CobsErrors();
             if (bs != s.lastBadSum || ce != s.lastCobsErrors) {
+                const unsigned long long dCobs = ce - s.lastCobsErrors;
+                const unsigned long long dSum  = bs - s.lastBadSum;
                 s.lastBadSum     = bs;
                 s.lastCobsErrors = ce;
+
+                    // 把这次缺口**说出来**。只计数的话用户看到的只是"地址比预期少"，
+                    // 没法把窗口里的野地址和丢帧对上号；偏移是本块内的，配合关闭时
+                    // 那行的累计值就能数清"第几次缺口、在哪儿"。
+                // 偏移用解帧器逐帧记的"出错帧起点"，不再用切片边界 `off`：
+                // off 永远是 512 的整数倍（实测 512、512、131584），指着检测时机
+                // 而不是坏字节，照它去数流里的字节会数错一整段。
+                const unsigned long long at    = s.deframer.LastErrorOffset();
+                const unsigned long long relAt = (at >= s.errBase) ? (at - s.errBase) : 0;
+                ORB_LOG_WARN("orbtrace: 解帧错 @ 流偏移 %llu（本块 %u/%u，COBS=%llu 校验=%llu，"
+                             "本次 +%llu）—— ETM 从这一点起失步，缺口之后的字节不再"
+                             "按相对地址解，丢弃数见 'ETM: 停止' 那行的 丢弃=",
+                             relAt, off, n, ce, bs, dCobs + dSum);
+
+                // 现场字节：出错帧起点前后各 16 字节。这是**唯一**能在不落盘的前提下
+                // 看到"坏字节长什么样"的地方 —— 判断是丢了一字节（后续整体错位）还是
+                // 某几个字节被改（位翻转），全靠这段。只在错误发生时打一条。
+                if (relAt >= blkBase && (relAt - blkBase) < n) {
+                    const unsigned pos = static_cast<unsigned>(relAt - blkBase);
+                    const unsigned lo  = (pos > 16) ? (pos - 16) : 0;
+                    unsigned       hi  = pos + 16;
+                    if (hi > n) hi = n;
+                    char   hex[3 * 34 + 4];
+                    size_t hl = 0;
+                    hex[0] = '\0';
+                    for (unsigned k = lo; k < hi; ++k) {
+                        if (k == pos) orb::fmt::Append(hex, sizeof(hex), hl, "| ");
+                        orb::fmt::Append(hex, sizeof(hex), hl, "%02X ", data[k]);
+                    }
+                    ORB_LOG_WARN("orbtrace: 出错帧起点的现场字节（块内 %u，自 %u 起，"
+                                 "| 处即出错帧起点）: %s",
+                                 pos, lo, hex);
+                }
 
                     // 解帧层的错误（COBS 错 / 校验和错）→ 官方 "Data Stream Error"
                     // （`DbgCM/Trace.h:149` T_ERR_DATA_ERR）。这两类错误原先只进日志，
@@ -226,6 +273,8 @@ void ProcessBytes(const uint8_t* data, unsigned n)
                     // 丢了一帧 = ETM 字节流里有缺口：相对地址的基准断了，解码器接着算
                     // 出来的全是假地址（P0-D）。ITM 不受影响 —— 帧边界就是它的包边界。
                 EtmTraceForceSync(false);
+                    // 同理：错误点之后直到下一个 0x00 都不可信，先对齐再解。
+                s.deframer.DropToDelimiter();
             }
         }
     } else {
@@ -436,12 +485,22 @@ bool OrbTraceStart(orb::Dap& dap, int width, int swo, int baud, bool oflow)
 
     // ---- 解码器就位 -------------------------------------------------------
     s.deframer.Reset();
+    // ⚠ 开流那一刻探针里可能正卡着上一段会话的半帧（退出调试后目标还在跑，ETM
+    //   没关）。不清到定界符就开解，会把半帧尾巴当 interval count，一路错到撞出
+    //   一次 COBS 错为止 —— 日志里连接后那条 `解帧错 ... COBS=1` 就是它，代价是
+    //   ETM 白白失步一段。
+    s.deframer.DropToDelimiter();
     s.stats  = OrbTraceStats();
     s.reads  = 0;
     s.noData = 0;
     s.errors = 0;
-    s.lastBadSum     = 0;
-    s.lastCobsErrors = 0;
+    // ⚠ 基准取解帧器的**当前**累计值，不能写 0：deframer 的计数跨会话保留
+    //   （Reset() 刻意不动它们，见 Oflow.cpp 的说明），写 0 等于把上一场会话的错误数
+    //   算进本次的增量 —— 日志里出现过 `COBS=2 ... 本次 +2`、`COBS=3 ... 本次 +3`
+    //   这种"增量等于累计"的形状，看着像一次错了两次。
+    s.lastBadSum     = s.deframer.BadSum();
+    s.lastCobsErrors = s.deframer.CobsErrors();
+    s.errBase        = s.deframer.BytesIn();
     s.lastDropped    = 0;
     s.writeTicks     = 0;
     s.sawData = false;

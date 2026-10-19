@@ -143,9 +143,6 @@ struct TRACECPUState
 
     // Convinience, for debug reporting
     genericsReportCB report;
-
-    // Debugging
-    uint64_t overflows;
 };
 
 // ============================================================================
@@ -165,9 +162,7 @@ struct TRACEDecoderEngine
     void ( *forceSync )     ( struct TRACEDecoderEngine *e, bool isSynced );
     const char ( *name )    ( void );
 
-    /* Config specific to ETM3.5.
-     * 形参名原为 `using` —— 那是 C++ 关键字，按 C++ 编译时是语法错误，
-     * 改名 `usingAlt`（语义不变）。 */
+    /* Config specific to ETM3.5 */
     void ( *altAddrEncode ) ( struct TRACEDecoderEngine *e, bool usingAlt );
 };
 

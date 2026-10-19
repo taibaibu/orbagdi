@@ -345,7 +345,7 @@ std::wstring SelfDir() {
     return DirOf(path);
 }
 
-/// A Keil install root, e.g. C:\Keil_v5.
+/// A Keil install root, e.g. <drive>:\Keil_v5.
 std::wstring KeilRoot() {
     for (const wchar_t* v : {L"KEIL_ROOT", L"UV4", L"KEIL_ARM_ROOT"}) {
         std::wstring r = Env(v);

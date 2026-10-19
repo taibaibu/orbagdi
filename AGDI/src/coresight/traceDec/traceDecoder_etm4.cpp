@@ -185,12 +185,6 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
     }
     else
     {
-        if ( c == 0x05 && j->asyncCount == 1 )
-        {
-            cpu->overflows++;
-            DEBUG( "Overflow Detected. ReSync Trace Stream:" EOL );
-        }
-
         j->asyncCount = c ? 0 : j->asyncCount + 1;
 
         switch ( j->p )
@@ -243,7 +237,8 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
                         break;
 
-                    case 0b11111000: case 0b11111001: case 0b11111010: case 0b11111011: case 0b11111100: case 0b11111101: case 0b11111110: case 0b11111111: /* Atom Format 3, Figure 6-41, Pg 6-305 */
+                    case 0b11111000: case 0b11111001: case 0b11111010: case 0b11111011:
+                    case 0b11111100: case 0b11111101: case 0b11111110: case 0b11111111: /* Atom Format 3, Figure 6-41, Pg 6-305 */
                         cpu->eatoms = ( 0 != ( c & 1 ) ) + ( 0 != ( c & 2 ) ) + ( 0 != ( c & 4 ) );
                         cpu->natoms = 3 - cpu->eatoms;
                         cpu->instCount += 3;
@@ -340,9 +335,19 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
 
                         break;
 
-                    case 0b11000000: case 0b11000001: case 0b11000010: case 0b11000011: case 0b11000100: case 0b11000101: case 0b11000110: case 0b11000111: case 0b11001000: case 0b11001001: case 0b11001010: case 0b11001011: case 0b11001100: case 0b11001101: case 0b11001110: case 0b11001111: case 0b11010000: case 0b11010001: case 0b11010010: case 0b11010011: case 0b11010100:
-                    case 0b11100000: case 0b11100001: case 0b11100010: case 0b11100011: case 0b11100100: case 0b11100101: case 0b11100110: case 0b11100111: case 0b11101000: case 0b11101001: case 0b11101010: case 0b11101011: case 0b11101100: case 0b11101101: case 0b11101110: case 0b11101111: case 0b11110000: case 0b11110001: case 0b11110010: case 0b11110011: case 0b11110100: /* Atom format 6, Figure 6-44, Pg 6.307 */
-                        cpu->eatoms = ( c & 0x1f ) + 4;
+                    case 0b11000000: case 0b11000001: case 0b11000010: case 0b11000011:
+                    case 0b11000100: case 0b11000101: case 0b11000110: case 0b11000111:
+                    case 0b11001000: case 0b11001001: case 0b11001010: case 0b11001011:
+                    case 0b11001100: case 0b11001101: case 0b11001110: case 0b11001111:
+                    case 0b11010000: case 0b11010001: case 0b11010010: case 0b11010011:
+                    case 0b11010100:
+                    case 0b11100000: case 0b11100001: case 0b11100010: case 0b11100011:
+                    case 0b11100100: case 0b11100101: case 0b11100110: case 0b11100111:
+                    case 0b11101000: case 0b11101001: case 0b11101010: case 0b11101011:
+                    case 0b11101100: case 0b11101101: case 0b11101110: case 0b11101111:
+                    case 0b11110000: case 0b11110001: case 0b11110010: case 0b11110011:
+                    case 0b11110100: /* Atom format 6, Figure 6-44, Pg 6.307 */
+                        cpu->eatoms = ( c & 0x1f ) + 3;
                         cpu->instCount = cpu->eatoms;
                         cpu->disposition = ( 1 << ( cpu->eatoms ) ) - 1;
 
@@ -372,11 +377,17 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         break;
 
 
-                    case 0b10100000: case 0b10100001: case 0b10100010: case 0b10100011: case 0b10100100: case 0b10100101: case 0b10100110: case 0b10100111: case 0b10101000: case 0b10101001: case 0b10101010: case 0b10101011: case 0b10101100: case 0b10101101: case 0b10101110: case 0b10101111: /* Q instruction trace packet, Figure 6-45, Pg 6-308 */
+                    case 0b10100000: case 0b10100001: case 0b10100010: case 0b10100011:
+                    case 0b10100100: case 0b10100101: case 0b10100110: case 0b10100111:
+                    case 0b10101000: case 0b10101001: case 0b10101010: case 0b10101011:
+                    case 0b10101100: case 0b10101101: case 0b10101110: case 0b10101111: /* Q instruction trace packet, Figure 6-45, Pg 6-308 */
 
                         break;
 
-                    case 0b01110001: case 0b01110010: case 0b01110011: case 0b01110100: case 0b01110101: case 0b01110110: case 0b01110111: case 0b01111000: case 0b01111001: case 0b01111010: case 0b01111011: case 0b01111100: case 0b01111101: case 0b01111110: case 0b01111111: /* Event tracing, Figure 6-31, Pg 6-289 */
+                    case 0b01110001: case 0b01110010: case 0b01110011:
+                    case 0b01110100: case 0b01110101: case 0b01110110: case 0b01110111:
+                    case 0b01111000: case 0b01111001: case 0b01111010: case 0b01111011:
+                    case 0b01111100: case 0b01111101: case 0b01111110: case 0b01111111: /* Event tracing, Figure 6-31, Pg 6-289 */
                         if ( c & 0b0001 )
                         {
                             _stateChange( cpu, EV_CH_EVENT0 );
@@ -410,8 +421,6 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         cpu->addr = j->q[match].addr;
                         retVal = TRACE_EV_MSG_RXED;
                         _stateChange( cpu, EV_CH_ADDRESS );
-                        _stackQ( j );
-                        j->q[0].addr = cpu->addr;
                         break;
 
                     case 0b10010101: /* Short address, IS0 short, Figure 6-32, Pg 6-294 */
@@ -547,13 +556,15 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         _stateChange( cpu, EV_CH_EXRETURN );
                         break;
 
-                    case 0b00100000: case 0b00100001: case 0b00100010: case 0b00100011: case 0b00100100: case 0b00100101: case 0b00100110: case 0b00100111: /* Data sync mark, Figure 6-15, Pg 6-275 */
+                    case 0b00100000: case 0b00100001: case 0b00100010: case 0b00100011:
+                    case 0b00100100: case 0b00100101: case 0b00100110: case 0b00100111: /* Data sync mark, Figure 6-15, Pg 6-275 */
                         cpu->dsync_mark = c & 0x07;
                         retVal = TRACE_EV_MSG_RXED;
                         _stateChange( cpu, EV_CH_DATASYNC );
                         break;
 
-                    case 0b00101000: case 0b00101001: case 0b00101010: case 0b00101011: case 0b00101100: /* Unnumbered data sync mark, Figure 6-16, Pg 6-275 */
+                    case 0b00101000: case 0b00101001: case 0b00101010: case 0b00101011:
+                    case 0b00101100: /* Unnumbered data sync mark, Figure 6-16, Pg 6-275 */
                         cpu->udsync_mark = c & 0x07;
                         retVal = TRACE_EV_MSG_RXED;
                         _stateChange( cpu, EV_CH_UDATASYNC );
@@ -693,7 +704,7 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                 }
                 else
                 {
-                    if ( j->idx == 9 )
+                    if ( j->idx == 8 )
                     {
                         /* Second byte of IS1 case - mask MSB */
                         j->q[0].addr = ( j->q[0].addr & ( ~( 0x7F << j->idx ) ) ) | ( ( c & 0x7f ) << ( j->idx ) );

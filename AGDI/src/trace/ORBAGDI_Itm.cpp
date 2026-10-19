@@ -830,6 +830,16 @@ void ProgramEtm(orb::Dap& dap)
         }
     }
 
+    // 3d) A-SYNC 周期（ETMCR[25:24]，IHI0014Q Table 3-5）：00=1024B 01=512B 10=256B 11=128B。
+    //     为什么不留给默认值：默认 1024 意味着"使能时那一次 A-SYNC 一旦错过，就要等最多
+    //     1 KB 才有下一个基准"。实测代价不是"开头缺几条"，而是整段落相对地址错位 ——
+    //     日志里写成"地址清一色 0x902Cxxxx、野地址占 37%"。设成 128 字节一档后，错过
+    //     也最多错 128 字节就能自愈；代价约 +6% 带宽（8 字节 A-SYNC / 128 字节）。
+    //     时机同 bit28：只能在 ETMSR[1]=1 时改非 Progbit 位，所以必须在清 Progbit 之前。
+    //     直写不读：这颗 ETM 上该字段回读恒为 0（实测 6 次全 0），回读判不出成败、
+    //     也改不了结果，只会产出一条误导性的"写不进去"告警。
+    ModifyReg32(dap, etm + kOffEtmCr, kEtmCrSyncFreqMask, kEtmCrSyncFreq128);
+
     // 4) 清 Progbit = 开始采集，并等 ETMSR[1] = 0（Figure 3-3 第二次轮询）。
     //    这里**重新读一次 ETMCR**（EtmSetProgbit 内部做的），不用上面那个 cr：
     //    进编程模式之后硬件可能已经改了别的位，拿旧值写回等于把它们改回去。
@@ -1071,6 +1081,11 @@ bool ItmRearmTarget(orb::Dap& dap)
                      : (st.armed.mode == TraceSetup::SwoManchester) ? "SWO Manchester"
                                                                     : "SWO NRZ",
                  st.armed.width, st.armed.baudHz, st.armed.acprBaseKhz, ok ? 1 : 0);
+
+    // SyncFreq（ETMCR[25:24]）只认器件描述给的值：PDSC 有 TraceStart 序列时由序列写
+    // （与官方驱动一致 —— 官方对 0xE0041000 只用于内存属性判定，从不写 ETMCR）；没有
+    // 序列时 ProgramEtm 已经写成 128 字节。本层不再额外补一发 —— 那一发必须进/出编程
+    // 模式，会清 FIFO 并把序列刚使能时发的 A-SYNC 冲掉，代价大于收益。
     return ok;
 }
 

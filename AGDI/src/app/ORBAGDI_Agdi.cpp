@@ -745,19 +745,93 @@ bool Connect() {
             ORB_LOG_WARN("AGDI: TraceStart sequence failed");
     }
 
+        // ---- 抽数线程必须在任何一次"让目标跑起来"之前 ----
+        // 进入调试模式时那一发连接复位不是"停着不动"：复位后内核会自由运行几毫秒
+        // 才被 halt 住，ETM 在这几毫秒里已经在出包（含使能时的 A-SYNC 与第一批
+        // 分支包）。原来这一句放在复位之后，等于那几毫秒没人读探针 —— FIFO 一旦
+        // 被这几毫秒的数据推过头，A-SYNC 就落在窗口外，解码器只能从半路起步，
+        // ETM 又是相对寻址，于是**每条 trace 的第一条都错**，后面全跟着错。
+        // 所以线程先起（它没有源在跑时自己空转，无副作用），复位/重臂/resume 都排在它后面。
+    TracePumpStart();
+
     // "Reset after Connect" / "Stop after Reset" (Debug page).  Without the
     // reset request "Stop after Reset" has nothing to stop after - the session
     // halts the core anyway.
-    if (opt.resetAfterConnect && !c.core.Reset(opt.stopAfterReset)) {
-        ORB_LOG_WARN("AGDI: reset after connect failed");
-    } else if (opt.resetAfterConnect) {
-                // 这一发复位会把刚编好的 trace 寄存器打回默认，不补一次则整场收不到 trace。
-        RearmTargetTraceAfterReset("reset after connect");
+    // ⚠ worker 已经在跑，复位期间主线程也要碰探针：拿锁（等 worker 让出）再做，
+    // 否则 reset / Rearm 的 DAP 事务会和抽数线程的 bulk 读交错。
+    // 这一段按顺序做四件事（顺序不能换，见下面每一步的说明）：
+    //   ① 复位 → 抽走旧字节 → **等队列解空**
+    //   ② 清解码器 + Rearm → 抽走复位到 Rearm 之间的碎片 → 再等解空 → 再清解码器
+    //   ③ 清窗口/缓冲（从这一刻起算）
+    //   ④ 抽 Rearm 之后的包（含周期性 A-SYNC）
+    // 为什么②要清两次：上一次调试退出后目标还在跑、ETM 没被关（日志里
+    // `Pdsc: DebugCoreStop absent - skipped`），探针里一直有"上一个世界"的包；
+    // 而复位到 Rearm 之间内核已自由运行、ETM/TPIU 却还是复位默认值，那些字节也不是
+    // 有效 trace。任一批被解进窗口，位置都在**最前端** —— 拖到时间轴最左就看见乱码。
+    // 第一次连接没有这两段残留，所以只有第二次出问题。
+    bool resetOk = false;
+    {
+        ComLockWait probe(500);
+        if (!probe.Held()) {
+            ORB_LOG_WARN("AGDI: 复位前拿不到探针（worker 正忙），reset 照做");
+        }
+        if (opt.resetAfterConnect) {
+            if (!c.core.Reset(opt.stopAfterReset)) {
+                ORB_LOG_WARN("AGDI: reset after connect failed");
+            } else {
+                resetOk = true;
+            }
+        }
     }
 
-    // 抽数工作线程随会话起（官方 `DSMonitor_Thread` 也是 `DSM_StartMonitor` 里
-    // 建、会话结束才收）。它自己会在没有源在跑时什么都不做。
-    TracePumpStart();
+    if (resetOk) {
+            // ---- ① 抽走"上一个世界"的字节，并且**把队列解空** ----
+            // 只 DrainOnce 不等队列是之前的老问题：字节搬进队列后由解码线程慢慢解，
+            // 而 EtmTraceReset() 只清解码器状态、**不清队列**。排队的旧字节会在清完
+            // 之后才被解出来，重新污染 lastPc 并落进窗口最前端 —— 拖到时间轴最左看
+            // 到的就是那几条按旧基准推出来的地址。所以抽完必须用 TracePumpSync 等空。
+            // 两个调用都必须在探针锁之外：worker 抽数要那把锁，持锁等它只会等到超时。
+        if (TracePumpRunning()) TracePumpDrainOnce(100);
+        if (TracePumpRunning()) TracePumpSync(300);
+
+        {
+            ComLockWait probe(500);
+                // 旧基准作废 —— 此刻队列已空（① 刚 Sync 过），清的就是全部历史。
+                // ⚠ 这一次清必须排在 Rearm **之前**，理由见 ②。
+            EtmTraceReset();
+        }
+
+            // ---- ② Rearm：让 ETM 重新使能，换一个属于新窗口的 A-SYNC ----
+            // 规范保证重新使能后流里的第一个包就是 A-SYNC，所以它是 ① 清空之后
+            // 唯一的基准：清在它之后就会把这个 A-SYNC 一起丢掉，后面只能等
+            // 周期性的下一个（最多 1 KB 数据），开头那一段就没有基准。
+            // 整场只在这里做一次 —— 它要进编程模式、期间停采，不能当运行中的补同步。
+        {
+            ComLockWait probe(500);
+                    // 这一发复位会把刚编好的 trace 寄存器打回默认，不补一次则整场收不到 trace。
+            RearmTargetTraceAfterReset("reset after connect");
+        }
+
+            // ---- ③ 窗口从这一刻起算 ----
+            // 放在最后而不是复位之后：①② 解出来的东西（旧世界 + 复位那几毫秒）
+            // 一律丢掉。之前放在复位后、又被后面几分钟的数据填进来，等于没清。
+        TraceResetForTarget("reset after connect");
+    }
+
+        // ---- ④ 把 Rearm 之后的包（含 A-SYNC）收进解码器 ----
+        // 目标已 halt，FIFO 只出不进，这一次是**真能抽空**的。100 ms 是上限，抽空即返回。
+    if (TracePumpRunning() && !TracePumpDrainOnce(100)) {
+        ORB_LOG_WARN("AGDI: 复位后 100 ms 仍未抽空探针 FIFO，"
+                     "同步点可能不完整（Trace 开头会缺一段）");
+    }
+        // 基准是否真的建立起来，只在这一句里能看出来：清空之后解码器一律处于
+        // "等 A-SYNC"状态（见 CreateDecoder），所以这里 synced 为真 = 那段字节里
+        // 确实有 A-SYNC，整段相对地址有基准。为假不是错误（目标 halt 时可能没数据），
+        // 但若下一次 Run 之后仍无此行，就说明 A-SYNC 没收到，整段会错位。
+    if (TracePumpRunning() && EtmTraceIsSynced()) {
+        ORB_LOG_INFO("AGDI: Rearm 之后的 A-SYNC 已收到，本段基准从它起算");
+    }
+
     return true;
 }
 
@@ -2337,11 +2411,42 @@ U32 AG_Init(U16 nCode, void *vp)
         case AG_RESET: {
                         // 这里不清 trace：缓冲只在会话开始（Connect）时清。
             if (orb::agdi::Connect()) {
+                    // 复位前先把"上一个世界"的字节搬空并解空。
+                    // 只 reset 不搬的话，这些字节会在 EtmTraceReset() 之后才被解码线程
+                    // 解出来 —— 带着旧基准给复位后的新流起头，日志里就是 reset 之后
+                    // 99 ms 那条 `解帧错 ... COBS=n`，紧接着 ETM 强行失步到下一个 A-SYNC。
+                if (orb::agdi::TracePumpRunning()) orb::agdi::TracePumpDrainOnce(100);
+                if (orb::agdi::TracePumpRunning()) orb::agdi::TracePumpSync(300);
+
                 c.core.Reset(true);
-                                // 复位把目标侧 trace 寄存器打回默认，而它们只在 Connect 编程一次；
-                                // 不补这一次，复位后这一轮收不到任何 trace 包。
-                                // 必须写限定名：本处在 extern "C" 全局作用域。
-                orb::agdi::RearmTargetTraceAfterReset("reset");
+
+                    // 复位到此刻的碎片：内核在自由运行，而 ETM/TPIU 还是复位默认值，
+                    // 这些字节即使成帧也不是有效 trace。搬走、解空。
+                if (orb::agdi::TracePumpRunning()) orb::agdi::TracePumpDrainOnce(100);
+                if (orb::agdi::TracePumpRunning()) orb::agdi::TracePumpSync(300);
+
+                {
+                        // 队列空了再清解码器（复位前的字节流已经断了）。
+                        // ⚠ 清必须排在 Rearm **之前**。
+                    orb::agdi::ComLockWait probe(500);
+                    orb::agdi::EtmTraceReset();
+                }
+
+                {
+                        // Rearm：复位把目标侧 trace 寄存器打回默认（只在 Connect 编程一次，
+                        // 不补则整场收不到包）——重新使能后规范保证第一个包是 A-SYNC，
+                        // 那是刚清空之后唯一的基准。每次复位补一次，整场不重复。
+                        // 必须写限定名：本处在 extern "C" 全局作用域。
+                    orb::agdi::ComLockWait probe(500);
+                    orb::agdi::RearmTargetTraceAfterReset("reset");
+                }
+
+                    // 把这个 A-SYNC 收进解码器；之后不再清 —— 再清就得等下一个周期性 sync，
+                    // 那段时间（现在 128 字节，见 ProgramEtm 的 SyncFreq）没有基准。
+                if (orb::agdi::TracePumpRunning()) orb::agdi::TracePumpDrainOnce(100);
+                if (orb::agdi::TracePumpRunning() && orb::agdi::EtmTraceIsSynced()) {
+                    ORB_LOG_INFO("AGDI: 复位后 Rearm 的 A-SYNC 已收到，本段基准从它起算");
+                }
                                 // 首次打开目标时装寄存器布局（官方在首次复位后、跳过 flash 下载时装）；
                                 // 幂等，后续复位是空操作。
                 orb::agdi::InstallRegView();

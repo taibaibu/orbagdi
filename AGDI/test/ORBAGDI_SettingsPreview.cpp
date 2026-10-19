@@ -44,7 +44,7 @@ const char kSample[] =
     "rddi=CMSIS_DAP.DLL;iface=-1;clock=1000;port=1;ap=0;"
     "swo=115200;cpu=72000;orbtrace=1;trwidth=4;trswo=0;trbaud=2000000;"
     "troflow=1;ports=FFFFFFFF;pcpresc=2;"
-    "flm=\"C:\\Keil_v5\\ARM\\Flash\\STM32F4xx_512.FLM\"";
+    "flm=\"%KEIL_ROOT%\\ARM\\Flash\\STM32F4xx_512.FLM\"";
 
 } // namespace
 

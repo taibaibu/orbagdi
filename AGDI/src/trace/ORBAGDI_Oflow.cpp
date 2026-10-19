@@ -21,6 +21,7 @@ OflowDeframer::OflowDeframer()
     cobsErrors_  = 0;
     shortFrames_ = 0;
     bytesIn_     = 0;
+    errOffset_   = 0;
     Reset();
 }
 
@@ -32,13 +33,26 @@ void OflowDeframer::Reset()
     maxCount_      = false;
 }
 
+// 丢弃到下一个定界符再从帧边界开始。
+// 为什么需要：kIdle 会把**任意**一个非零字节当成 interval count —— 如果流的起点
+// 落在半帧中间（接探针时残帧、或链路出错后的第一个字节），它会一路错解到撞出一次
+// COBS 错为止。那一次"撞"正是日志里的 `解帧错 ... COBS=n`，而它连带让 ETM 失步、
+// 丢掉缺口后的一段。先对齐再解，这些假错误就不存在了。
+void OflowDeframer::DropToDelimiter()
+{
+    state_         = kDraining;
+    len_           = 0;
+    intervalCount_ = 0;
+    maxCount_      = false;
+}
+
 // COBS 包凑齐后的拆分（orbuculum Src/oflow.c:81 _pumpcb）。
-void OflowDeframer::Deliver(OflowFrameFn cb, void* user)
+bool OflowDeframer::Deliver(OflowFrameFn cb, void* user)
 {
     // OFLOW 帧至少要有一个 tag 字节和一个校验字节。
     if (len_ < 2) {
         ++shortFrames_;
-        return;
+        return false;
     }
 
     OflowFrame f;
@@ -55,16 +69,29 @@ void OflowDeframer::Deliver(OflowFrameFn cb, void* user)
     f.good = (sum == 0);
 
     ++frames_;
-    if (!f.good) ++badSum_;
+    const bool bad = !f.good;
+    if (bad) ++badSum_;
 
     if (cb) cb(f, user);
+    return bad;
 }
 
 // orbuculum Src/cobs.c:110 COBSPump() 的逐字节等价实现。
 void OflowDeframer::Pump(const uint8_t* in, int len, OflowFrameFn cb, void* user)
 {
     if (!in || len <= 0) return;
+
+    // ---- 出错帧的定位 ------------------------------------------------------
+    // 调用方按 512 B 切片喂入、每片结束才查计数，所以"检测到错"和"错发生"之间
+    // 最多差一整片。这里在解帧器内部把每帧的起点记下来：出错时写 errOffset_
+    // = 该帧起点在整条流里的绝对字节号，精度 1 字节。
+    //
+    // frameStart 是帧起点在**本次调用**内的下标；-1 表示这一帧跨了片边界
+    // （调用开始时 state_ 已经是 kRxing），真实起点在上一片里，此时退化成用
+    // 本片起点 —— 误差 < 一片，仍比原来"报片末"准得多，而且不会指向还没读到的字节。
+    const unsigned long long base = bytesIn_;
     bytesIn_ += (unsigned long long)len;
+    int frameStart = (state_ == kRxing) ? -1 : 0;
 
     const uint8_t* fp = in;
     for (int i = 0; i < len; ++i, ++fp) {
@@ -77,6 +104,7 @@ void OflowDeframer::Pump(const uint8_t* in, int len, OflowFrameFn cb, void* user
                 intervalCount_ = *fp;
                 maxCount_      = (*fp == 255);
                 state_         = kRxing;
+                frameStart     = i;
             }
             break;
 
@@ -91,14 +119,20 @@ void OflowDeframer::Pump(const uint8_t* in, int len, OflowFrameFn cb, void* user
             if (intervalCount_ == 0) {
                 if (kOflowSyncChar == *fp) {
                     // 定界符：一帧结束
-                    Deliver(cb, user);
-                    len_   = 0;
-                    state_ = kIdle;
+                    if (Deliver(cb, user)) {
+                        errOffset_ = base + (frameStart < 0 ? 0u
+                                                           : (unsigned long long)frameStart);
+                    }
+                    len_       = 0;
+                    state_     = kIdle;
+                    frameStart = 0;
                 } else {
                     // 隐含一个 0x00，当前字节是新的 interval count
                     if (!maxCount_) {
                         if (len_ >= kOflowMaxEncoded) {
                             ++cobsErrors_;
+                            errOffset_ = base + (frameStart < 0 ? 0u
+                                                               : (unsigned long long)frameStart);
                             state_ = kDraining;
                             break;
                         }
@@ -111,6 +145,8 @@ void OflowDeframer::Pump(const uint8_t* in, int len, OflowFrameFn cb, void* user
                 // 帧溢出，或帧内出现了不该有的定界符
                 if (len_ > kOflowCobsMaxPacket || kOflowSyncChar == *fp) {
                     ++cobsErrors_;
+                    errOffset_ = base + (frameStart < 0 ? 0u
+                                                       : (unsigned long long)frameStart);
                     state_ = kDraining;
                 } else if (len_ < kOflowMaxEncoded) {
                     buf_[len_++] = *fp;

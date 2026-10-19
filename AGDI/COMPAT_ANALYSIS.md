@@ -14,7 +14,7 @@
 ---
 # COMPAT_ANALYSIS — ORB_AGDI 对 Keil `CMSIS_AGDI.dll` 的逆向与 ABI 对照
 
-> 基准（官方）：`D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll`
+> 基准（官方）：`<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll`
 > v1.33.24.0，x86(32)，imagebase `0x10000000`，构建 2025-07-09，约 2.4 MB。
 > 对照（本工程）：`bin\ORB_AGDI.dll`。
 > 工具：`ORBMDK/tools/pe_re.py`（`exports` / `dis` / `hex` / `names` / `xref`）。
@@ -364,11 +364,11 @@ ETB 读取本质是"DAP 内存访问"：RDDI 只提供 `DAP_*`/MEM-AP 原语，*
 *本文数据可用如下命令复现（`ORBMDK/tools` 下）：*
 
 ```
-python pe_re.py exports "D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll"
-python pe_re.py dis "D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll" 0x10005FE0 0x160
-python pe_re.py dis "D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll" 0x10011D20 0x70
-python pe_re.py hex "D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll" 0x10011ED8 0x80
-python pe_re.py names "D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll" "Flash|Erase|Program|Verify"
+python pe_re.py exports "<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll"
+python pe_re.py dis "<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll" 0x10005FE0 0x160
+python pe_re.py dis "<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll" 0x10011D20 0x70
+python pe_re.py hex "<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll" 0x10011ED8 0x80
+python pe_re.py names "<KEIL_ROOT>\ARM\BIN\CMSIS_AGDI.dll" "Flash|Erase|Program|Verify"
 ```
 
 ---
@@ -1699,14 +1699,6 @@ orbuculum 的协议里只有 `DEFAULT_ITM_STREAM 1` / `DEFAULT_ETM_STREAM 2`（`
 对旧表示 22 B 是 **3.1–4.4×**。内存不再是"10 ms"那一档，但**仍然不是无限**：全指令下
 记录速率 = 执行指令率（上限 48 M/s），1.5 GB 也只够 **3.5–6 s**。
 
-**P2-1 也已落地（2026-10-13）**：`ORBAGDI_TraceFile.{h,cpp}` 把 trace 流写成 orbuculum 的
-**OFLOW 文件**（`%%ORBFLOW1.0.0%%` + COBS/OFLOW 字节流；`orbtrace` 源原样落盘，`swo=`/`etb=`
-由本层编码成帧）。文件名 `ORB_trace_YYYYMMDD_HHMMSS.orb`（带时间、不带版本号），
-`trfile=` 开、`trkeep=` 只留最近 N 个。**已用 orbuculum 自己的 `Src/cobs.c`（未改一行）**
-编的独立读器 `test\ofl_read.exe` 验证：字节数 / 帧数 / 坏校验和 / COBS 错 / tag 2 载荷
-**五项与驱动日志逐项相等** ⇒ `orbmortem`/`orbcat`/`orbdump` 与它同一条码路，能直接打开。
-"查询回落到文件"（内存窗口之外按索引回读）是下一步 P2-2，现在文件先交给外部工具看。
-
 ### 10.26 抽数架构：官方在独立线程 + 时间预算；我们放在了调试线程（2026-10-12，方案重写）
 
 **本节取代原来的 §10.24 / §10.25**（那两节的修法已全部撤除、正文已删除，代码也回退到它们之前）。
@@ -2925,10 +2917,6 @@ Remove-Item "$env:TEMP\ORB_rec_*.trc"                      # 记录日志也会�
 **前置**
 1. `bin\ORB_AGDI.dll` 已 `-Deploy`（见本节头部；**改过驱动就要重新部署**）。
 2. 固件 = 4 位并行（`TRACE_USE_SWO=0` + `TRACE_PARALLEL_BITS=4`，main.c）。
-3. 选项里**必须**写 `trrec=1`（P2-2 的记录日志），并把内存压小到装不下整段：
-   `trchunk=1 trmem=2` —— 否则内存装得下全部，永远没有"文件段"，P2-2 无从验。
-   （`trfile=1` 是 P2-1 的 OFLOW 落盘，与回看无关，可不填。）
-4. Trace 页把 trace 使能打开；目标**跑 ≥ 10 s**（内存窗口只有秒级，要留出更早的段）。
 
 **步骤与判据**
 
@@ -3366,7 +3354,7 @@ SWO 档还要把 PB3 配成 `TRACESWO`）。**只改驱动 `trwidth` 而固件�
       1/2/4bit Data` + `SWO UART (NRZ)` + `SWO Manchester`）。**一个下拉写回两个键**
       （`trwidth` + `trswo`），SWO 档不动 `trwidth` —— 切回并口时要用回用户原来那一档。
       （2026-10-14，见下面"Trace 页收尾"。）
-- [x] **新增第 6 页 "Record"：记录缓冲 + 落盘 5 个键上界面**（2026-10-14）——
+- [x] **新增第 6 页 "cache"：记录缓冲 + 落盘 5 个键上界面**（2026-10-14）——
       这 5 个原来是"只能手改选项串"，而 §0.7 的 P1-1 / P2-2 实机验收**必须**手填它们
       （`trchunk=1 trmem=2 trrec=1 trfile=1 trkeep=2`；默认 1 GB 上限一辈子到不了，
       "内存窗口之外回看"那条路就走不到）。页签顺序：`Debug / Trace / Flash / Pack /
@@ -3374,8 +3362,6 @@ SWO 档还要把 PB3 配成 `TRACESWO`）。**只改驱动 `trwidth` 而固件�
       - `Record Buffer` 组：`trchunk=`（每块 MB）+ `trmem=`（内存上限 MB），
         并写明 "0 = 默认：4 MB/块，上限 = 物理内存/4 封顶 1 GB；**只在第一次 Connect
         生效**"。
-      - `Logging` 组：`trfile=`（OFLOW 落盘）+ `trrec=`（记录日志），各带 `...` 文件
-        选择按钮（`GetSaveFileNameW`，`.orb` / `.trc`）+ `trkeep=`（同目录保留几个）。
       - 底部状态行 `kIdValRecInfo`（`RecInfo()`）回显**生效值**：每块 MB、上限、
         换算出的块数、两条路径、keep —— 因为 "0" 是默认而不是"关"，不写出来看不出。
       - 校验：块大小 0 或 1..4096；上限 0 或 1..65536；keep 0 或 1..999；
@@ -7205,16 +7191,6 @@ uVision 一取数什么都取不到 ⇒ 窗口归零。
 2. ⚠⚠ **可以离线 A/B 分支地址编码**（`--alt 0|1`）—— 同一个文件跑两遍，哪一遍地址正常
    就是哪一遍对。**这是本次最大的价值**：判定"编码选错"还是"字节流本身坏了"从"改选项串
    重跑真机"降到"两秒钟跑两遍"。
-
-#### 13.2 怎么用（拿捕获文件是唯一需要 Keil 的一步）
-
-```
-1) 选项串加 `trfile=1`（或 `trfile=D:\cap.orb`）—— 跑**一次**真机会话
-   ⇒ 得到 %TEMP%\ORB_trace_<时间>.orb
-2) 之后全部离线：
-     test\bin\etm_replay.exe  <那个 .orb>            # 默认 --alt 1（与驱动默认一致）
-     test\bin\etm_replay.exe  <那个 .orb> --alt 0    # A/B 另一档
-```
 
 **✅ 2026-10-14 又包了一层，一条命令跑完整个闭环**（用户："你来自动化处理这个问题吧"）：
 

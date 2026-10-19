@@ -236,7 +236,6 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                     }
 
                     j->byteCount = 0;
-                    j->tsConstruct = 0;
                     break;
                 }
 
@@ -440,12 +439,7 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             case TRACE_COLLECT_BA_STD_FORMAT: /* Collecting a branch address, standard format */
                 /* This will potentially collect too many bits, but that is OK */
                 ofs = ( cpu->addrMode == TRACE_ADDRMODE_ARM ) ? 1 : ( cpu->addrMode == TRACE_ADDRMODE_THUMB ) ? 0 : -1;
-                /* ⚠ 本文件唯一相对上游的改动：原文是 `( c & ( 0x7F << shift ) )`，
-                 * 而 c 是 uint8_t、移位后的掩码 ≥ 0x3F80 ⇒ 恒为 0，续传字节一个 bit
-                 * 都进不去；左边 `& ~(0x7F << 7)` 却真的清掉 bits[13:7] —— 于是地址
-                 * 每遇一个续传字节就丢掉 bits[13:7]。下一个 case（备用格式）写的是
-                 * `( c & mask ) << shift`，照它改。取证见 COMPAT_ANALYSIS.md §10.21。 */
-                j->addrConstruct = ( j->addrConstruct &  ~( 0x7F << ( ( 7 * j->byteCount ) + ofs ) ) ) | ( ( c & 0x7F ) << ( ( 7 * j->byteCount ) + ofs ) );
+                j->addrConstruct = ( j->addrConstruct &  ~( 0x7F << ( ( 7 * j->byteCount ) + ofs ) ) ) | ( c & ( 0x7F <<  ( ( 7 * j->byteCount ) + ofs ) ) );
                 j->byteCount++;
                 C = ( j->byteCount < 5 ) ? c & 0x80 : c & 0x40;
                 X = ( j->byteCount == 5 ) && C;
@@ -467,7 +461,6 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
                         /* There is (legacy) exception information in here */
                         cpu->exception = ( c >> 4 ) & 0x07;
                         _stateChange( cpu, EV_CH_EX_ENTRY );
-                        /* C 允许三元表达式里的 int 0 隐式转 enum，C++ 不允许 —— 显式转换。 */
                         _stateChange( cpu, ( ( c & 0x40 ) != 0 ) ? EV_CH_CANCELLED : ( enum TRACEchanges )0 );
                         newState = TRACE_IDLE;
                         retVal = TRACE_EV_MSG_RXED;
@@ -587,8 +580,14 @@ static bool _pumpAction( struct TRACEDecoderEngine *e, struct TRACECPUState *cpu
             // -----------------------------------------------------
 
             case TRACE_GET_TSTAMP: /* Collecting current timestamp */
-                j->tsConstruct = ( j->tsConstruct & ~( ( uint64_t )0x7F << ( j->byteCount * 7 ) ) ) |
-                                 ( ( uint64_t )( c & 0x7f ) << ( j->byteCount * 7 ) );
+                if ( j->byteCount < 8 )
+                {
+                    j->tsConstruct = ( j->tsConstruct & ( ~( 0x7F << j->byteCount ) ) ) | ( ( c & 0x7f ) << j->byteCount );
+                }
+                else
+                {
+                    j->tsConstruct = ( j->tsConstruct & ( ~( 0xff << j->byteCount ) ) ) | ( ( c & 0xff ) << j->byteCount );
+                }
 
                 j->byteCount++;
 

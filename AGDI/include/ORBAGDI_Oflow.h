@@ -41,6 +41,10 @@ public:
     // 丢弃半个帧、回到 IDLE（统计保留）。
     void Reset();
 
+    // 丢弃到下一个定界符、从帧边界重新开始（统计保留）。
+    // 接流时、以及每次判定"字节流不可信"之后调 —— 见 cpp 里的说明。
+    void DropToDelimiter();
+
     // 喂入任意长度字节，每凑齐一帧回调一次。
     void Pump(const uint8_t* in, int len, OflowFrameFn cb, void* user);
 
@@ -51,10 +55,21 @@ public:
     unsigned long long ShortFrames() const { return shortFrames_; }
     unsigned long long BytesIn()     const { return bytesIn_; }
 
+    // 最近一次解帧错（COBS 错 / 校验和错）那一帧的**起点**在输入流中的绝对字节
+    // 偏移（与 BytesIn() 同一坐标系，即"第几个字节"）。
+    //
+    // 为什么要在解帧器内部记：调用方（OrbTrace.cpp）把字节按 512 B 切片喂进来，
+    // 每片结束才检查计数，原来报出来的偏移永远是 512 的整数倍（实测 512、512、
+    // 131584），看着像"错在第 512 字节"，其实那只是检测时机。而 ETM 的分支地址
+    // 是相对编码，排查时必须知道坏字节在哪儿 —— 差几百字节就会把一整段假地址
+    // 算到错误的帧头上。逐帧记的精度是 1 字节。
+    unsigned long long LastErrorOffset() const { return errOffset_; }
+
 private:
     enum State { kIdle, kRxing, kDraining };
 
-    void Deliver(OflowFrameFn cb, void* user);
+    // 返回 true 表示这一帧校验和不对（Pump 用它记录出错帧的起点）。
+    bool Deliver(OflowFrameFn cb, void* user);
 
     State    state_;
     uint8_t  buf_[kOflowMaxEncoded];  // 解码中的帧（含 tag 与 sum）
@@ -67,6 +82,7 @@ private:
     unsigned long long cobsErrors_;
     unsigned long long shortFrames_;
     unsigned long long bytesIn_;
+    unsigned long long errOffset_;  // 见 LastErrorOffset()
 };
 
 } // namespace agdi

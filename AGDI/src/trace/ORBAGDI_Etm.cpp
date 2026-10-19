@@ -51,6 +51,17 @@ struct Sink {
     // 周期轴 —— 混着推等于把两种时基相加。先到的那个拥有这一段。
     int                timeSrc;
     unsigned long long syncLosses;   // 因字节流缺口被迫重新同步的次数
+    // 未同步期间解出、被**丢弃**（不上报 TraceWin / 不建覆盖率段）的地址数。
+    // 单独计数是必需的：静默丢弃时用户只看到"地址数变少"，看不到"因为失步丢了这么多"。
+    unsigned long long dropped;
+    // 解出的地址落在"任何常见映射区"之外的次数。限流日志只说明"有"，累计值才说明
+    // "多少" —— 进汇总行，用来区分"偶发几条"与"整段都错"。
+    unsigned long long wildAddrs;
+    // 流开头 256 字节，跨 Feed 累积 —— 判"基准/编码从哪来"的唯一凭据。
+    // （只打第一帧没用：orbtrace 一帧可能只有 1 字节。）
+    uint8_t            head[256];
+    unsigned           headLen;
+    bool               dumpedHead;
 
     // ---- P1-0：全指令 trace（靠代码镜像补直接分支） ------------------------
     uint32_t           lastPc;       // 上一个已知地址 = 扫描起点
@@ -66,7 +77,7 @@ struct Sink {
           cpuid(0), partno(0), coreName("?"),
           addresses(0), atoms(0), exceptions(0),
           timestamps(0), cycles(0), lastCycle(0), lastTs(0), timeSrc(0),
-          syncLosses(0),
+          syncLosses(0), dropped(0), wildAddrs(0), headLen(0), dumpedHead(false),
           lastPc(0), haveLastPc(false), scanInstrs(0), scanGaps(0),
           scanBranchOuts(0), scanFails(0),
           dap(nullptr)
@@ -115,6 +126,11 @@ void CreateDecoder()
     const bool alt = orb::cfg::Get().etmAltAddr;
     TRACEDecoderInit(&s.dec, p, alt, nullptr);
     s.created = true;
+    // "清空之后必须等下一个 A-SYNC" 是这一层的契约，这里显式写一次，不靠上游默认值。
+    // 少了它，EtmTraceReset() 之后的第一批字节会被当成已同步的连续流直接解 —— 相对
+    // 地址没有基准，解出来就是整片假地址（日志里 0x902Cxxxx、野地址占 37% 那种）。
+    // 未同步时换行之后库自己会丢弃字节直到 A-SYNC，正是我们要的"清空后重新起步"。
+    TRACEDecoderForceSync(&s.dec, false);
     // 加载 —— 整个会话只打这一条（新增字段**追加在末尾**，前面的锚点不变）。
     ORB_LOG_INFO("ETM: 解码器加载 —— 协议 %s，目标 %s (CPUID=0x%08X PARTNO=0x%03X)，"
                  "分支地址编码=%s（etmalt=%d）",
@@ -226,40 +242,70 @@ void OnReport(void* d)
         // ---- 诊断：把"明显不是代码"的地址打出来，只打日志不过滤 ----
         // 记录里唯一带地址的就是本段末尾的 TraceWinEtmInstruction(cpu->addr)，所以 uVision 反汇编
         // 用的垃圾地址只可能来自它；机制是喂进去的字节本身错了（地址白名单已被用户否决）。
-        // 只打前 8 条：热路径每秒几十万次，不能刷屏。
+        // 限流：前 8 条 + 之后每 65536 条一条。原来用函数内 static 计数，
+        // 既跨会话不归零（第二次会话一条都不打），也只报 8 条 —— 首轮就因此误判成
+        // "只在开头出错"。累计数进汇总行（`野地址=`），才能分清偶发与整段都错。
+        // Cortex-M 只有 Thumb 一种指令集。解码库把 IADDRESS 的 bit0=0 解释成
+        // "ARM 状态"（traceDecoder_etm35.cpp:777），一旦在错误位置解出这样一个地址，
+        // addrMode 就被切成 ARM 并一直保持，之后每条分支地址都按 ARM 的 ofs=1 构造，
+        // 整段跟着漂移。日志里"模式=1(ARM) thumb=1"就是这种自相矛盾的状态 ——
+        // 目标不可能在 ARM 态，错的是解码器的判断，所以每次地址事件都钉回 THUMB。
+        if (cpu->addrMode != TRACE_ADDRMODE_THUMB || !cpu->thumb) {
+            cpu->addrMode = TRACE_ADDRMODE_THUMB;
+            cpu->thumb    = true;
+        }
+
+        // ETM 关闭（TraceDisable / EOT）时给的"地址"落在 0xFFFFFFFF 附近，它不是指令：
+        // 进窗口会把反汇编引到 0xFFFFFFxx，留作 lastPc 则下一条 IADDRESS 直接在它上面
+        // 累加（日志里 `上一条地址=0xFFFFF988` 后紧跟 0x09023940 就是这条链）。
+        // EOT 的语义是"这一段结束"，之后必须有新的 A-SYNC，所以这里强制失步，
+        // 让解码器回 UNSYNCED 等同步头，而不是带着错位继续解下去。
+        if (cpu->addr >= 0xFFFFFF00u) {
+            EtmTraceForceSync(false);
+            s.haveLastPc = false;
+        }
+
         {
-            static int s_wildLogged = 0;
-            if (s_wildLogged < 8) {
-                const uint32_t a = cpu->addr;
-                const orb::cfg::Config c = orb::cfg::Effective();
-                bool plausible = false;
-                if (c.iromSize) {
-                    if (a >= c.iromStart &&
-                        static_cast<uint64_t>(a) <
-                            static_cast<uint64_t>(c.iromStart) + c.iromSize) {
-                        plausible = true;                  // 器件声明的 Flash
-                    }
-                    if (a < c.iromSize) plausible = true;  // 启动别名区
+            const uint32_t a = cpu->addr;
+            const orb::cfg::Config c = orb::cfg::Effective();
+            bool plausible = false;
+            if (c.iromSize) {
+                if (a >= c.iromStart &&
+                    static_cast<uint64_t>(a) <
+                        static_cast<uint64_t>(c.iromStart) + c.iromSize) {
+                    plausible = true;                  // 器件声明的 Flash
                 }
-                if (!plausible) {
-                    if (a >= 0x10000000u && a <= 0x1FFFFFFFu) plausible = true;  // CCM/系统
-                    if (a >= 0x20000000u && a <= 0x3FFFFFFFu) plausible = true;  // SRAM
-                    if (a >= 0x40000000u && a <= 0x5FFFFFFFu) plausible = true;  // 外设
-                    if (a >= 0x60000000u && a <= 0x9FFFFFFFu) plausible = true;  // 外部 RAM
-                    if (a >= 0xE0000000u)                     plausible = true;  // 内核私有
-                }
-                if (!plausible) {
-                    ++s_wildLogged;
+                if (a < c.iromSize) plausible = true;  // 启动别名区
+            }
+            if (!plausible) {
+                if (a >= 0x10000000u && a <= 0x1FFFFFFFu) plausible = true;  // CCM/系统
+                if (a >= 0x20000000u && a <= 0x3FFFFFFFu) plausible = true;  // SRAM
+                if (a >= 0x40000000u && a <= 0x5FFFFFFFu) plausible = true;  // 外设
+                if (a >= 0x60000000u && a <= 0x9FFFFFFFu) plausible = true;  // 外部 RAM
+                if (a >= 0xE0000000u)                     plausible = true;  // 内核私有
+            }
+            if (!plausible) {
+                ++s.wildAddrs;
+                if (s.wildAddrs <= 8 || (s.wildAddrs % 65536) == 0) {
                     ORB_LOG_WARN("ETM: 解出的地址 **0x%08X** 不在任何常见映射区"
-                                 "（第 %d/8 条）—— 同步=%d，上一条地址=0x%08X，"
-                                 "本次会话地址累计=%llu。这是**输入字节有错**的症状"
-                                 "（§8.2），不是解码器算错；"
-                                 "记录里带地址的只有 ETM 指令这一条",
-                                 a, s_wildLogged,
+                                 "（累计 %llu 条，本条为打印点）—— 同步=%d，"
+                                 "上一条地址=0x%08X，本次会话地址累计=%llu，"
+                                 "解码器认为 模式=%d(0=THUMB 1=ARM 2=JAZELLE) thumb=%d",
+                                 a, s.wildAddrs,
                                  EtmTraceIsSynced() ? 1 : 0,
                                  s.haveLastPc ? s.lastPc : 0u,
-                                 s.addresses);
+                                 s.addresses,
+                                 static_cast<int>(cpu->addrMode),
+                                 cpu->thumb ? 1 : 0);
                 }
+            }
+
+            // 前 64 条地址（含正常的）：看第一条野地址前面到底发生了什么 ——
+            // 是 IADDRESS 给错基准，还是分支包逐条累加漂移，只有序列能回答。
+            if (s.addresses <= 64) {
+                ORB_LOG_INFO("ETM: 地址#%llu = 0x%08X thumb=%d%s",
+                             s.addresses, a, cpu->thumb ? 1 : 0,
+                             plausible ? "" : " (野)");
             }
         }
 
@@ -269,6 +315,16 @@ void OnReport(void* d)
         // 错误态；未同步时连起点都不更新。补出来的指令必须先于分支目标记录，时间轴才对。
         const bool synced = EtmTraceIsSynced();
         if (!synced) {
+                // 丢弃这些地址是对的（相对地址基准未知），但**不能静默**：
+                // 否则用户只看到"地址数比预期少"，不知道少在该失步的那一段上。
+                // 限流：前 3 条 + 之后每 4096 条一条；总数进 EtmTraceLogSummary。
+            ++s.dropped;
+            if (s.dropped <= 3 || (s.dropped % 4096) == 0) {
+                ORB_LOG_WARN("ETM: 未同步，丢弃地址 0x%08X（累计 %llu 条；缺口重同步 %llu 次）"
+                             "—— 相对基准未知，这类地址不进 Trace 窗口、不建覆盖率段，"
+                             "等下一个 A-SYNC/ISYNC",
+                             cpu->addr, s.dropped, s.syncLosses);
+            }
             s.haveLastPc = false;
         } else {
             if (s.haveLastPc) FillGap(s.lastPc, cpu->addr);
@@ -411,6 +467,30 @@ void EtmTraceFeed(const uint8_t* data, size_t len)
 
     EnterCriticalSection(&s.cs);
 
+    // 流开头 256 字节（跨 Feed 累积，因为一帧可能只有 1 字节）是判"基准从哪来"
+    // 的唯一凭据：ETM 的地址是相对的，第一个 A-SYNC / IADDRESS 决定整段基准。
+    if (s.headLen < sizeof(s.head)) {
+        const unsigned room = static_cast<unsigned>(sizeof(s.head)) - s.headLen;
+        const unsigned m    = (len < room) ? static_cast<unsigned>(len) : room;
+        memcpy(s.head + s.headLen, data, m);
+        s.headLen += m;
+    }
+    if (!s.dumpedHead && s.headLen == sizeof(s.head)) {
+        s.dumpedHead = true;
+        static const char* kHex = "0123456789ABCDEF";
+        for (unsigned row = 0; row < sizeof(s.head); row += 32) {
+            char hex[3 * 32 + 1];
+            for (unsigned i = 0; i < 32; ++i) {
+                const uint8_t b = s.head[row + i];
+                hex[i * 3]      = kHex[b >> 4];
+                hex[i * 3 + 1]  = kHex[b & 0xF];
+                hex[i * 3 + 2]  = ' ';
+            }
+            hex[3 * 32] = '\0';
+            ORB_LOG_INFO("ETM: 流开头 +%02u：%s", row, hex);
+        }
+    }
+
     // TRACEDecoderPump 的签名要 uint8_t*（非 const）。引擎只读它，所以
     // const_cast 安全；不拷贝是为了避免每个 OFLOW 帧都多一次 memcpy。
     TRACEDecoderPump(&s.dec, const_cast<uint8_t*>(data), static_cast<int>(len),
@@ -474,6 +554,10 @@ void EtmTraceReset()
     s.lastTs = 0;
     s.timeSrc = 0;
     s.syncLosses = 0;
+    s.dropped    = 0;
+    s.wildAddrs  = 0;
+    s.headLen    = 0;
+    s.dumpedHead = false;
 
     // P1-0：解码器重建了，地址序列要重新建立基准（第一段只能当起点）。
     // ⚠ 代码镜像不在这里清：本函数每次开流都会调，而镜像可能是刚 Download 存下来的，
@@ -498,12 +582,14 @@ void EtmTraceLogSummary(const char* where)
     // 测试脚本按 `=(\d+)` 取数。写成"地址 N 条"那种自然语言形式看着顺眼，
     // 但解析不了 —— `test\trace_stream.ps1` 就靠这一行判 P0-D。
     ORB_LOG_INFO("ETM: 停止(%s) 地址=%llu 原子=%llu 异常=%llu 时间戳=%llu "
-                 "周期=%llu 同步=%d 缺口重同步=%llu 协议=%s 时间源=%s",
+                 "周期=%llu 同步=%d 缺口重同步=%llu 协议=%s 时间源=%s 丢弃=%llu "
+                 "野地址=%llu",
                  where ? where : "?",
                  s.addresses, s.atoms, s.exceptions,
                  s.timestamps, s.cycles,
                  EtmTraceIsSynced() ? 1 : 0, s.syncLosses,
-                 EtmTraceProtocolName(), TimeSrcName(s.timeSrc));
+                 EtmTraceProtocolName(), TimeSrcName(s.timeSrc), s.dropped,
+                 s.wildAddrs);
 
     // 周期轴的现场证据（P0-F′）：ETM 模式的时间轴到底接没接通、是谁在推、
     // 推了多少。`source=ETM cycle count` + `bTS=1` 就是"纯 ETM 流也有真实

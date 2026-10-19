@@ -214,10 +214,15 @@ Write-Ok ("{0}  ({1:N0} bytes)" -f 'ORBAGDI_OrbTraceProbe.exe', (Get-Item $OrbOu
 # ---------------------------------------------------------------------------
 Write-Step 'Compiling the OFLOW file reader'
 # 旁边那份 orbuculum checkout：先找 AGDI 的上一级，再找上两级（两份布局都见过）。
+# 目录名不写死——从发行包解出来的那几份带版本号（orbuculum-2.2.0），
+# 所以要按 orbuculum* 匹配，再用 Src\cobs.c 确认是不是源码树。
 $Orbuculum = $null
-foreach ($c in @((Join-Path (Split-Path -Parent $Root) 'orbuculum'),
-                 (Join-Path (Split-Path -Parent (Split-Path -Parent $Root)) 'orbuculum'))) {
-    if (Test-Path (Join-Path $c 'Src\cobs.c')) { $Orbuculum = $c; break }
+foreach ($base in @((Split-Path -Parent $Root), (Split-Path -Parent (Split-Path -Parent $Root)))) {
+    if (-not (Test-Path $base)) { continue }
+    foreach ($c in (Get-ChildItem $base -Directory -Filter 'orbuculum*' -ErrorAction SilentlyContinue)) {
+        if (Test-Path (Join-Path $c.FullName 'Src\cobs.c')) { $Orbuculum = $c.FullName; break }
+    }
+    if ($Orbuculum) { break }
 }
 $CobsSrc = if ($Orbuculum) { Join-Path $Orbuculum 'Src\cobs.c' } else { '' }
 if (-not $CobsSrc -or -not (Test-Path $CobsSrc)) {

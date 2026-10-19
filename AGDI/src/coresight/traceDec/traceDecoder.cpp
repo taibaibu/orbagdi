@@ -66,12 +66,10 @@ struct TRACECPUState *TRACECPUState( struct TRACEDecoder *i )
 const char *TRACEExceptionName( int exceptionNumber )
 
 {
-    /* orbuculum 这里用的是 C99 复合字面量 `(char *[]){...}`，C++ 编不过，
-     * 改成静态数组。名字与顺序原样保留。 */
-    static const char *const kExceptionNames[] =
+    static const char *const names[] =
     {"???", "PE Reset", "NMI", "HardFault", "MemManage", "BusFault", "UsageFault", "SecureFault", "???", "???", "???", "SVC", "Debug Monitor", "???", "PendSV", "SysTick", "IRQ"
     };
-    return kExceptionNames[( exceptionNumber < 16 ) ? exceptionNumber : 16];
+    return names[( exceptionNumber < 16 ) ? exceptionNumber : 16];
 }
 // ====================================================================================================
 

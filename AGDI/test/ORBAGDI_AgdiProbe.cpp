@@ -41,6 +41,13 @@
  *                         flash is odd" from "every read is odd"
  *     --memwrite <hex>    scratch address for the write/read-back check
  *                         (omitted: read-only, nothing is written to the target)
+ *     --tracepins         bring up the target's 4-bit parallel trace port before
+ *                         running: RCC_AHB1ENR.GPIOEEN, GPIOE PE2..PE6 as AF0,
+ *                         high speed, and DBGMCU_CR TRACE_MODE = 4-bit sync.
+ *                         Firmware that never touches these leaves the port
+ *                         high-Z, so the probe reads 0 bytes and it looks like
+ *                         the probe is not sending.  Nothing is written unless
+ *                         this flag is given.
  *     --device <name>     device name for the debug block
  *     --flash <hex>       Intel HEX image to download, then read back and compare
  *     --flm <path>        flash algorithm; appended to the option string as flm=
@@ -1169,6 +1176,7 @@ int main(int argc, char** argv) {
     unsigned    wrAdr   = 0;
     unsigned    pokeAdr = 0;
     unsigned    pokeVal = 0;
+    bool        tracePins = false;  // --tracepins: 让目标的 4-bit 并口 trace 引脚真的输出
     unsigned    runMs   = 0;
     unsigned    pollMs  = 0;        // --poll: 运行期间狂打"拿不到锁就失败"的入口（P0-A′）
     bool        useBom  = false;    // --bom: 自己当宿主交出 ioc，验收记录/区间查询
@@ -1220,6 +1228,7 @@ int main(int argc, char** argv) {
             pokeAdr = strtoul(argv[++i], nullptr, 0);
             pokeVal = strtoul(argv[++i], nullptr, 0);
         }
+        else if (!strcmp(argv[i], "--tracepins"))                tracePins = true;
         else if (!strcmp(argv[i], "--run") && i + 1 < argc)     runMs = strtoul(argv[++i], nullptr, 0);
         else if (!strcmp(argv[i], "--poll") && i + 1 < argc)    pollMs = strtoul(argv[++i], nullptr, 0);
         else if (!strcmp(argv[i], "--bom"))                     useBom = true;
@@ -1307,6 +1316,7 @@ int main(int argc, char** argv) {
     printf("    driver  : %s\n", dll);
     printf("    options : %s\n", options);
     if (wrAdr) printf("    memwrite: 0x%08X\n", wrAdr);
+    if (tracePins) printf("    tracepin: PE2..PE6 (TRACED0..3 + TRACECLK), DBGMCU 4-bit sync\n");
     if (g_haveImage) {
         printf("    image   : %s - %u block(s), 0x%08X..0x%08X, %lu bytes\n",
                flashHex, static_cast<unsigned>(g_image.Count()),
@@ -1419,6 +1429,72 @@ int main(int argc, char** argv) {
     Note("supp: MemAccR=%u RegAccR=%u ResetR=%u ExtBrkSupp=%u ItmTrace=%u hTrace=%u hPaLyze=%u",
          supp.MemAccR, supp.RegAccR, supp.ResetR, supp.ExtBrkSupp,
          supp.ItmTrace, supp.hTrace, supp.hPaLyze);
+
+    // -----------------------------------------------------------------------
+    // --tracepins: 4-bit 并行 trace 的引脚与 DBGMCU。
+    //
+    // 目标固件通常一个 trace 引脚寄存器都不碰（D:\Work\STM32F429 那个工程就是这样，
+    // main() 只有空循环），而主机侧只写 DBGMCU_CR —— 于是 TRACE_MODE 选对了 4-bit
+    // sync，PE2..PE6 却因为 RCC_AHB1ENR.GPIOEEN = 0 始终是高阻：探针端点 0 字节，
+    // 看上去像"探针不发数据"。这里把主机欠的几步补上，全部 read-modify-write。
+    if (tracePins) {
+        Step("Trace pins: PE2..PE6 = TRACED0..3 + TRACECLK, DBGMCU 4-bit sync");
+        const U32 kRcc   = 0x40023830u;   // RCC_AHB1ENR
+        const U32 kModer = 0x40021000u;   // GPIOE_MODER
+        const U32 kSpd   = 0x40021008u;   // GPIOE_OSPEEDR
+        const U32 kAfr   = 0x40021020u;   // GPIOE_AFRL
+        const U32 kDbg   = 0xE0042004u;   // DBGMCU_CR
+
+        auto Rd = [&](U32 adr, U32& v) -> bool {
+            UC8 b[4] = {0, 0, 0, 0};
+            GADR a; a.Adr = adr; a.ErrAdr = 0;
+            if (g_api.AG_MemAcc(AG_READ, b, &a, 4) != AG_OK) return false;
+            v = (U32)b[0] | ((U32)b[1] << 8) | ((U32)b[2] << 16) | ((U32)b[3] << 24);
+            return true;
+        };
+        auto Wr = [&](U32 adr, U32 v) -> bool {
+            UC8 b[4]; memcpy(b, &v, 4);
+            GADR a; a.Adr = adr; a.ErrAdr = 0;
+            return g_api.AG_MemAcc(AG_WRITE, b, &a, 4) == AG_OK;
+        };
+
+        U32 rcc = 0, moder = 0, spd = 0, afr = 0, dbg = 0;
+        if (!Rd(kRcc, rcc) || !Rd(kModer, moder) || !Rd(kSpd, spd) ||
+            !Rd(kAfr, afr) || !Rd(kDbg, dbg)) {
+            Fail("could not read the trace registers - the MEM-AP refused");
+        } else {
+            Note("before: AHB1ENR=0x%08X MODER=0x%08X OSPEEDR=0x%08X AFRL=0x%08X DBGMCU_CR=0x%08X",
+                 rcc, moder, spd, afr, dbg);
+
+            if (rcc & (1u << 4)) {
+                Note("GPIOEEN was already set");
+            } else if (Wr(kRcc, rcc | (1u << 4))) {
+                Pass("RCC_AHB1ENR: GPIOEEN (bit 4) set - without it PE2..PE6 ignore AFR");
+            } else {
+                Fail("RCC_AHB1ENR: the write was refused");
+            }
+
+            const U32 kAf   = 0x2AA0u;    // PE2..PE6 -> MODER 10 (alternate function)
+            const U32 kMask = 0x3FF0u;    // PE2..PE6 占 bits 13:4
+            if (Wr(kModer, (moder & ~kMask) | kAf)) Pass("GPIOE_MODER: PE2..PE6 = AF");
+            else                                    Fail("GPIOE_MODER: the write was refused");
+            if (Wr(kSpd, (spd & ~kMask) | kAf))     Pass("GPIOE_OSPEEDR: PE2..PE6 = high speed");
+            else                                    Fail("GPIOE_OSPEEDR: the write was refused");
+            if (Wr(kAfr, afr & ~(0xFFFFFu << 8)))   Pass("GPIOE_AFRL: PE2..PE6 = AF0 (TRACE)");
+            else                                    Fail("GPIOE_AFRL: the write was refused");
+
+            const U32 kDbgWant = (dbg & ~(7u << 5)) | (1u << 5) | (3u << 6);
+            if (Wr(kDbg, kDbgWant)) Pass("DBGMCU_CR: TRACE_IOEN=1, TRACE_MODE=11 (4-bit sync)");
+            else                    Fail("DBGMCU_CR: the write was refused");
+
+            U32 after = 0;
+            if (Rd(kRcc, after) && (after & (1u << 4))) {
+                Pass("read back: AHB1ENR = 0x%08X, GPIOEEN is on", after);
+            } else {
+                Fail("read back: GPIOEEN did not stick");
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     if (pokeAdr) {

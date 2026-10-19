@@ -238,7 +238,7 @@ bool LooksLikeKeilRoot(const char* dir) {
     return DirExistsA(probe);
 }
 
-/// A Keil install root, e.g. C:\Keil_v5 - the environment uVision sets first,
+/// A Keil install root, e.g. <drive>:\Keil_v5 - the environment uVision sets first,
 /// then the usual drives (same policy as the Settings dialog).
 bool KeilRootA(char* out, size_t cch) {
     static const char* kEnv[] = { "KEIL_ROOT", "UV4", "KEIL_ARM_ROOT" };
@@ -290,7 +290,7 @@ char g_toolRoot[MAX_PATH];
 char g_packRoots[kMaxPackRoots][MAX_PATH];
 int  g_packRootCount = -1;
 
-/// Splits a RTEPATH style value ("D:\Keil_v5\Packs", possibly quoted, possibly
+/// Splits a RTEPATH style value ("<Keil root>\Packs", possibly quoted, possibly
 /// a ';' separated list) and appends every existing directory in it.
 void AddRootList(char roots[][MAX_PATH], int& n, const char* val) {
     if (!val || !*val) return;

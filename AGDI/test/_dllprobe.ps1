@@ -1,6 +1,33 @@
 # Temporary diagnostic: reproduce uVision's Target-DLL "checker entry" from a
 # 32-bit host. Must be run by SysWOW64\WindowsPowerShell (32-bit).
+param([string]$KeilArmBin = '')
+
 $ErrorActionPreference = 'Continue'
+
+# 目标目录不写死：-KeilArmBin 显式给 > uVision 自己的环境变量 > 各盘符下的常见
+# 安装名（与 build.ps1 / Settings 对话框同一套探测策略）。
+if (-not $KeilArmBin) {
+    foreach ($v in @($env:KEIL_ROOT, $env:UV4, $env:KEIL_ARM_ROOT)) {
+        if ($v -and (Test-Path (Join-Path $v 'ARM\BIN'))) {
+            $KeilArmBin = Join-Path $v 'ARM\BIN'
+            break
+        }
+    }
+}
+if (-not $KeilArmBin) {
+    foreach ($root in @('C:\', 'D:\', 'E:\')) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($k in @('Keil_v5', 'Keil', 'Keil_v4', 'MDK')) {
+            $c = Join-Path $root (Join-Path $k 'ARM\BIN')
+            if (Test-Path (Join-Path $c 'CMSIS_AGDI.dll')) { $KeilArmBin = $c; break }
+        }
+        if ($KeilArmBin) { break }
+    }
+}
+if (-not $KeilArmBin) {
+    Write-Output 'Keil ARM\BIN not found; pass -KeilArmBin <dir>'
+    exit 2
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -24,8 +51,8 @@ Write-Output ("is64bit-process = " + [Environment]::Is64BitProcess)
 $sweeps = @{}
 
 $targets = @(
-    @{ Path = 'D:\Keil_v5\ARM\BIN\ORB_AGDI.dll';   Safe = $true  },
-    @{ Path = 'D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll'; Safe = $false }
+    @{ Path = (Join-Path $KeilArmBin 'ORB_AGDI.dll');   Safe = $true  },
+    @{ Path = (Join-Path $KeilArmBin 'CMSIS_AGDI.dll'); Safe = $false }
 )
 
 foreach ($t in $targets) {

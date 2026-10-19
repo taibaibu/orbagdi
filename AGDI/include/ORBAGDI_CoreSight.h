@@ -51,6 +51,10 @@ enum : uint32_t {
     kEtmCrEtmen      = 0x00000800u,  // bit11 采集使能
     kEtmCrCycleAcc   = 0x00001000u,  // bit12 周期精确（周期计数包）
     kEtmCrTsEna      = 0x10000000u,  // bit28 时间戳使能（ETMCCER[22]=1 才有效）
+    // bit25:24 SyncFreq —— A-SYNC 的发送周期（IHI0014Q Table 3-5）：
+    // 00 = 1024 B，01 = 512 B，10 = 256 B，11 = 128 B。
+    kEtmCrSyncFreqMask = 0x03000000u,
+    kEtmCrSyncFreq128  = 0x03000000u,  // 11 = 每 128 字节一个 A-SYNC
 };
 
 // ETMSR 位
