@@ -101,6 +101,9 @@ if (-not (Test-Path $Exe)) {
 
 $LogFile = Join-Path $env:TEMP 'ORB_AGDI.log'
 
+# 锚点行是 INFO，而驱动默认只记 ERROR —— 给下头启动的探针带上级别。
+$env:ORBAGDI_LOG_LEVEL = '1'
+
 # 每一档：并行 1/2/4 位，以及 SWO 的 NRZ / Manchester 两种编码。
 # trswo=0 走并口（trwidth 有效）；trswo=1/2 走 SWO 单引脚（trwidth 无意义）。
 #

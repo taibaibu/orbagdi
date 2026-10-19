@@ -21,12 +21,16 @@ enum Level {
 };
 
 // baseDir: folder that receives "ORB_AGDI.log" (usually %TEMP%). A trailing
-// separator is accepted.
+// separator is accepted. 环境变量 ORBAGDI_LOG_FILE 优先于它（可直接指定完整路径）。
 void Init(const wchar_t* baseDir);
 void Shutdown();
 void Write(int level, const char* fmt, ...);
 
-// Default kInfo. ORBAGDI_LOG_LEVEL in the environment overrides it.
+// 等级解析顺序（与 RDDI 层 ORBMDK_Log.cpp 同一套手顺）：
+//   %TEMP%\ORBAGDI_LOG_LEVEL（内容一个整数，运行中热更新，最多 1 秒生效）
+//   → 环境变量 ORBAGDI_LOG_LEVEL → 默认 kError（0=DEBUG .. 9=NONE）。
+// 删掉那个临时文件即回到环境变量/默认值，不用重启宿主。
+// SetLevel() 之后不再看文件与环境；GetLevel() 返回解析后的当前阈值。
 void SetLevel(int level);
 int  GetLevel();
 const wchar_t* FilePath();

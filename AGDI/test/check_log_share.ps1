@@ -52,6 +52,10 @@ public class L {
 
 $LogPath = Join-Path $env:TEMP 'ORB_AGDI.log'
 
+# 驱动默认只记 ERROR，但文件照样会在 Init 时建出来（这条断言的就是"建了"）。
+# 想把内容也看见，就给下头启动的进程带上级别。
+$env:ORBAGDI_LOG_LEVEL = '1'
+
 function Get-ClassName([IntPtr]$h) {
     $s = New-Object System.Text.StringBuilder 256
     [void][L]::GetClassName($h, $s, 256)

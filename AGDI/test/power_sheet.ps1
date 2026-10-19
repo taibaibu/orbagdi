@@ -124,6 +124,9 @@ function Get-ClassName([IntPtr]$h) {
 # ---------------------------------------------------------------------------
 $LogFile = Join-Path $env:TEMP 'ORB_AGDI.log'
 
+# `power:` 行是 INFO，驱动默认只记 ERROR —— 给下头启动的进程带上级别。
+$env:ORBAGDI_LOG_LEVEL = '1'
+
 function Get-PowerLines {
     if (-not (Test-Path $LogFile)) { return @() }
     try { return @([IO.File]::ReadAllLines($LogFile) | Where-Object { $_ -like '*power: *' }) }

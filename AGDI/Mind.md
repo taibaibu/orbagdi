@@ -59,6 +59,10 @@ powershell -ExecutionPolicy Bypass -File test\run-tests.ps1 -Clean    # 先清 t
 RDDI 层日志开关：`%TEMP%\ORBMDK_LOG_LEVEL`（内容 `0`=DEBUG，运行中热生效，
 删文件恢复默认 ERROR），日志落在 `%TEMP%\ORBMDK_RDDI.log`。
 
+AGDI 层是同一套手顺：`%TEMP%\ORBAGDI_LOG_LEVEL`（运行中热生效，删文件回到
+`ORBAGDI_LOG_LEVEL` 环境变量，再默认为 `8`=ERROR；`0`=DEBUG、`9`=全关），日志落在
+`%TEMP%\ORB_AGDI.log`，路径可用 `ORBAGDI_LOG_FILE` 覆盖。
+
 ---
 
 ## 实机全功能验证：怎么把 AGDI 层跑起来

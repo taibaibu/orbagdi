@@ -51,6 +51,10 @@ if (-not (Test-Path $Exe)) {
 
 $LogFile = Join-Path $env:TEMP 'ORB_AGDI.log'
 
+# 驱动默认只记 ERROR（与 RDDI 层一致）。这里断言的是 INFO 行，所以给下头启动的
+# 探针进程带上级别；探针自己继承这个环境变量。
+$env:ORBAGDI_LOG_LEVEL = '1'
+
 $script:fail = 0
 $script:skip = 0
 function Head($m) { Write-Host "==> $m" -ForegroundColor Cyan }

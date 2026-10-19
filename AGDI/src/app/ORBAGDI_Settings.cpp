@@ -1282,7 +1282,8 @@ std::wstring BuildInfoText(SheetCtx* ctx) {
     s += L"\r\n== Messages ==\r\n";
     s += ctx->report.empty() ? L"(none)\r\n" : ctx->report + L"\r\n";
 
-    s += L"\r\n== Log tail (%TEMP%\\ORB_AGDI.log) ==\r\n";
+    // 路径不写死：ORBAGDI_LOG_FILE 可以把日志挪到别处，上面 "log file" 行才是权威。
+    s += L"\r\n== Log tail ==\r\n";
     s += LogTail();
     s += L"\r\n";
     return s;
@@ -1615,7 +1616,7 @@ void AddPowerItems(DlgTpl& t) {
 // ===========================================================================
 void AddInfoItems(DlgTpl& t) {
     Lbl(t, L"Everything this driver was told, what it detected, and the tail of "
-           L"%TEMP%\\ORB_AGDI.log:", 6, 4, 386);
+           L"the driver log (see the 'log file' line below):", 6, 4, 386);
     Text(t, kIdEditInfo, 6, 16, 386, 170);
 }
 
