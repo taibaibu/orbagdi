@@ -14,9 +14,20 @@ void TracePumpStart();
 void TracePumpStop();
 bool TracePumpRunning();
 
+// 等解码线程把**此刻之前**入队的块全部处理完（队列屏障）。返回 false = 超时。
+// 没有队列（worker 没起来 / 分配失败）时立即返回 true，调用方自行回退到 OrbTracePump()。
+bool TracePumpSync(unsigned timeMs);
+
+// 停机后、**拿探针锁之前**调：叫醒抽数线程，等它把探针环里剩下的字节抽空，再等解码排空。
+// 返回 false = worker 没起来 / 超时（调用方照旧自己抽或直接上报）。
+// ⚠ 必须在拿探针锁之前调：worker 抽数要这把锁，持锁等它只会等到超时，
+// 于是最后一段（目标停下那一刻还在环里的字节）就落在"已通知 uVision 停止"之后 ——
+// 窗口显示空、导航空，而 store 里随后才多出这几十万条记录。
+bool TracePumpDrainOnce(unsigned timeMs);
+
 // 排空所有流式 trace 源（SWO / orbtrace），按 timeMs 限流；
 // 返回本轮搬走的字节数（0 = 无可搬）。必须在持探针锁时调，且只搬字节：
-// 落盘/解帧/解码交给 TraceDecodeStaged() 在锁外做，否则 worker 抱锁不放。
+// 写 cache / 解帧 / 解码交给 TraceDecodeStaged() 在锁外做，否则 worker 抱锁不放。
 unsigned TraceDrain(unsigned timeMs);
 
 // 处理 TraceDrain 刚搬出的 n 字节，必须在锁外调。

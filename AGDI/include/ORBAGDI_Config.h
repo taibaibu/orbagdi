@@ -62,7 +62,7 @@ struct Config {
     char flm[kPathMax];     // flash algorithm (.FLM); empty = no flash download
     unsigned ramAddr;       // RAM window the algorithm is copied into
     unsigned ramSize;
-    unsigned clockHz;       // 核心时钟 Hz（0 = 未知），不落盘，每次会话重读
+    unsigned clockHz;       // 核心时钟 Hz（0 = 未知），不入工程，每次会话重读
 
     // ---- Debug page ----
     int  port;              // kPortSwd / kPortJtag
@@ -112,14 +112,15 @@ struct Config {
     // trmax=：常驻记录条数上限，0 = 不限（默认）。
     // 硬编码条数会在 ETM 下静默裁掉大部分采集，要限大小请用 trmem=。
     int  trMaxRecs;         // trmax=    常驻记录条数上限，0 = 不限
-    // trace 落盘（P2-1）。空 = 不落盘；“1”/目录 = 自动命名，否则当作文件名。
-    // 默认只保留 trkeep 个文件，调试机盘小。
+    // trace 缓存文件（P2-1）。空 = 不写；“1”/目录 = 自动命名，否则当作文件名。
+    // **不是功能**：只是内存装不下时的临时缓存，新采集段一开始就删掉上一段的，
+    // 所以没有“保留几个”这个设置。
     char trFile[kPathMax];
-    int  trKeep;            // 同目录最多保留几个 ORB_trace_*.orb（0 = 不删）
-    // 记录日志（P2-2）：存紧凑记录，查询不必重解帧；与 trfile= 独立。
+    // 记录 cache（P2-2）：存紧凑记录，查询不必重解帧；与 trfile= 独立。
     char trRec[kPathMax];
-    // 落盘大小上限（MB，0 = 不限，默认 2048）。到顶停止追加并告警一次，
-    // 否则 opt-in 的落盘会把用户磁盘当缓冲用。
+    // cache 文件大小上限（MB，0 = 不限，**默认 0**）。默认不限是为了覆盖全程数据量：
+    // 到顶后文件冻结在最早那段、内存窗口继续 FIFO 滚动，时间轴中段会变成空洞。
+    // 填正值仍然有效（到顶停止追加并弹一次提示框），设置页 Trace Cache 页可改。
     int  trRecMB;
     int  pcPrescaler;       // "PC Sampling: Prescaler" combo index
     bool pcPeriodic;        // "Periodic"

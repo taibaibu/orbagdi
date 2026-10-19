@@ -1,12 +1,13 @@
 /**
  * @file ORBAGDI_TraceFile.cpp
- * @brief trace 落盘（OFLOW 文件 + 记录日志）。
+ * @brief trace 文件（OFLOW 溢出文件 + 记录 cache）。
  *
  * ① OFLOW 文件（trfile=，给外部工具）：魔数 "%%ORBFLOW1.0.0%%" + COBS/OFLOW 字节流。
- *    orbtrace 源原样落盘；swo= / etb=1 拿到的是裸字节流，由本层编码成帧再写。
- * ② 记录日志（trrec=，给本驱动回看）：一块退休时把紧凑记录字节流原样追加，索引记
+ *    orbtrace 源原样写入 cache；swo= / etb=1 拿到的是裸字节流，由本层编码成帧再写。
+ * ② 记录 cache（trrec=，给本驱动回看）：一块退休时把紧凑记录字节流原样追加，索引记
  *    {偏移, 该处第一条周期号}；查询按索引读回、用同一段解码展开，不必重解 ITM/ETM。
- * 文件名带时间不带版本号：ORB_trace_YYYYMMDD_HHMMSS.orb / ORB_rec_….trc，trkeep= 默认留 3 个。
+ * 文件名带时间不带版本号：ORB_trace_YYYYMMDD_HHMMSS.orb / ORB_rec_….trc。
+ * 这是**内存装不下时的临时缓存**，不是日志：上一段的文件在**新段开始时全删**（见 PruneOld）。
  */
 #include "pch.h"
 #include "ORBAGDI_TraceFile.h"
@@ -14,9 +15,10 @@
 #include "ORBAGDI_Log.h"
 
 #include <stdio.h>
+#include <stdlib.h>    // realloc / free（索引按需扩容）
 #include <string.h>
 #include <wchar.h>
-#include <algorithm>   // std::sort（trkeep 清理）
+#include <algorithm>   // std::sort（删上一段缓存时按名字排序）
 #include <vector>
 
 namespace orb {
@@ -26,21 +28,25 @@ namespace {
 // orbuculum `Src/orbuculum.c:70`：OFLOW 文件内容的签名。**不是文件名的一部分。**
 const char kOflowSig[] = "%%ORBFLOW1.0.0%%";
 
-// 索引条数上限（"索引留内存"的规模）：一条 16 B ⇒ 64 KB 封顶。
-const unsigned kMarkMax = 4096;
+// 索引规模：一条 16 B。初始 4096 条（64 KB），满时翻倍，封顶 65536 条（1 MB）。
+// ⚠ 不能是**固定** 4096：File cap 默认不限后，按 4 MB/块算 4096 条只覆盖 16 GB，
+// 之后的块会撞上"索引已满"而**完全不进索引** —— Locate 只能定位到最后一条 mark，
+// 再往后全靠顺序解码 GB 级数据。1 MB 覆盖 256 GB，一次会话远远够用。
+const unsigned kMarkInit     = 4096;
+const unsigned kMarkMaxTotal = 65536;
 
 struct Mark {
     uint64_t ofs;      // 文件偏移
     uint64_t cycle;    // 周期号
 };
 
-// 一份落盘文件的全部状态。
+// 一份 cache 文件的全部状态。
 struct FileState {
     FILE*              f;
     wchar_t            pathW[MAX_PATH];
     char               pathU8[MAX_PATH * 2];
     unsigned long long bytes;      // 已写字节（含签名）
-    unsigned long long raw;        // OFLOW：其中"原样落盘"的
+    unsigned long long raw;        // OFLOW：其中"原样写入 cache"的
     unsigned long long frames;     // OFLOW：其中"本层编码"的帧数
     bool               failed;
     // 文件大小上限（字节），0 = 不限；到顶就停止追加并告警一次。
@@ -48,13 +54,18 @@ struct FileState {
     // 环形覆盖要把索引里的偏移全部重基（Mark.ofs），代价大且容易出错。
     unsigned long long capBytes;
     bool               capWarned;
-    Mark               mark[kMarkMax];
+    bool               capped;      // 到过上限：不再追加，也不再算"可用"
+    bool               capTaken;    // 到顶提示已经取走过（每次开会话重置）
+        // 动态索引：满一条翻倍（64 KB → 1 MB）。`markCap` = 已分配条数（0 = 还没分配）。
+        // 数组在进程内复用：CloseFile 不释放，CloseAndDeleteFile 才还给系统。
+    Mark*              mark;
     unsigned           markCount;
+    unsigned           markCap;
     bool               markWarned;
 };
 
 FileState        s_ofl;   // OFLOW 文件（trfile=）
-FileState        s_rec;   // 记录日志（trrec=）
+FileState        s_rec;   // 记录 cache（trrec=）
 CRITICAL_SECTION s_cs;
 bool             s_csInit = false;
 
@@ -87,7 +98,7 @@ std::string NarrowUtf8(const wchar_t* s)
     return u;
 }
 
-// 日志所在目录（日志还没开时退回 %TEMP%）。落盘文件默认放这里 —— 和日志在一起，
+// 日志所在目录（日志还没开时退回 %TEMP%）。cache 文件默认放这里 —— 和日志在一起，
 // 好找，也好一起删。
 std::wstring LogDir()
 {
@@ -129,16 +140,16 @@ std::wstring AutoName(const wchar_t* prefix, const wchar_t* ext)
     return std::wstring(nm);
 }
 
-// `trkeep=<N>`：同一目录里只保留最近 N 个 `<prefix>_*.<ext>`。
+// 新采集段开始时，把同目录里**更早的** `<prefix>_*.<ext>` 全部删掉。
+// 写文件在本项目里不是功能，只是"内存装不下"时的临时缓存：上一段的数据留在盘上
+// 没有任何用处，只会越攒越多 —— 新段开始就是该删的时候，没有"保留几个"这个旋钮。
 // 名字里就是时间戳 ⇒ **按名字排序即按时间排序**，不用去读每个文件的时间。
-void PruneOld(const std::wstring& dir, const wchar_t* prefix, const wchar_t* ext, unsigned keep)
+unsigned PruneOld(const std::wstring& dir, const wchar_t* prefix, const wchar_t* ext)
 {
-    if (keep == 0) return;
-
     const std::wstring pat = dir + L"\\" + prefix + L"_*." + ext;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(pat.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return 0;
 
     std::vector<std::wstring> names;
     do {
@@ -146,30 +157,27 @@ void PruneOld(const std::wstring& dir, const wchar_t* prefix, const wchar_t* ext
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 
-    if (names.size() < keep) return;
+    if (names.empty()) return 0;
     std::sort(names.begin(), names.end());
 
-    // 新的那个还要占一个位置 ⇒ 只留 keep-1 个旧的。
+    // 本段的新文件在删完之后才建，所以这里有旧的就能全删。
     unsigned removed = 0;
-    while (names.size() >= keep) {
-        const std::wstring victim = dir + L"\\" + names.front();
-        names.erase(names.begin());
+    for (const std::wstring& n : names) {
+        const std::wstring victim = dir + L"\\" + n;
         if (DeleteFileW(victim.c_str())) {
             ++removed;
         } else {
-            // 删不掉（被别的进程打开？）不该影响本次落盘。
-            ORB_LOG_WARN("TraceFile: 旧落盘删不掉（%s）", NarrowUtf8(victim.c_str()).c_str());
+            // 删不掉（被别的进程打开？）不该影响本次写文件。
+            ORB_LOG_WARN("TraceFile: 旧缓存删不掉（%s）", NarrowUtf8(victim.c_str()).c_str());
         }
     }
-    if (removed) {
-        ORB_LOG_INFO("TraceFile: trkeep=%u，已删掉 %u 个旧落盘文件", keep, removed);
-    }
+    return removed;
 }
 
 // ---------------------------------------------------------------------------
 // 打开 / 关闭 / 写（两份文件共用）
 // ---------------------------------------------------------------------------
-bool OpenFile(FileState& st, const char* path, unsigned keep, unsigned capMB,
+bool OpenFile(FileState& st, const char* path, unsigned capMB,
               const wchar_t* prefix, const wchar_t* ext, const char* sig)
 {
     Lock();
@@ -201,22 +209,25 @@ bool OpenFile(FileState& st, const char* path, unsigned keep, unsigned capMB,
         dir.resize(dir.size() - 1);
     }
     if (dir.empty() || name.empty()) {
-        ORB_LOG_WARN("TraceFile: 落盘路径不合法（dir=\"%s\"），本次不落盘", path);
+        ORB_LOG_WARN("TraceFile: cache 路径不合法（dir=\"%s\"），本次不写 cache", path);
         return false;
     }
 
-    // 先清旧的，再建新的：这样 keep 是"含本次在内"的个数。
-    PruneOld(dir, prefix, ext, keep);
+    // **先删上一段的，再建本段的**：开新段就是"该删除时"，旧缓存留着没有意义。
+    const unsigned pruned = PruneOld(dir, prefix, ext);
+    if (pruned) {
+        ORB_LOG_INFO("TraceFile: 新段开始，删掉上一段遗留的 %u 个缓存文件", pruned);
+    }
 
     const std::wstring full = dir + L"\\" + name;
 
     Lock();
-    // ⚠ **`w+b` 而不是 `wb`**：记录日志要被**读回来**（P2-2 的查询回放），
+    // ⚠ **`w+b` 而不是 `wb`**：记录 cache 要被**读回来**（P2-2 的查询回放），
     // 只写流上 `fread` 一律返回 0 —— 那正是"回放一条也读不到"的成因。
     st.f = _wfopen(full.c_str(), L"w+b");
     if (!st.f) {
         Unlock();
-        ORB_LOG_WARN("TraceFile: 建不出落盘文件（%s）—— 本次不落盘",
+        ORB_LOG_WARN("TraceFile: 建不出 cache 文件（%s）—— 本次不写 cache",
                      NarrowUtf8(full.c_str()).c_str());
         return false;
     }
@@ -231,28 +242,42 @@ bool OpenFile(FileState& st, const char* path, unsigned keep, unsigned capMB,
     st.failed     = false;
     st.capBytes   = static_cast<unsigned long long>(capMB) << 20;
     st.capWarned  = false;
+    st.capped     = false;
+    st.capTaken   = false;
     st.markCount  = 0;
     st.markWarned = false;
 
-    // OFLOW 文件要写签名（orbuculum `Src/orbuculum.c:1175`）；记录日志没有签名。
+    // OFLOW 文件要写签名（orbuculum `Src/orbuculum.c:1175`）；记录 cache 没有签名。
     if (sig) {
         const size_t n = strlen(sig);
         if (fwrite(sig, 1, n, st.f) != n) {
             fclose(st.f);
             st.f = nullptr;
             Unlock();
-            ORB_LOG_WARN("TraceFile: 签名写不进去（%s）—— 本次不落盘", st.pathU8);
+            ORB_LOG_WARN("TraceFile: 签名写不进去（%s）—— 本次不写 cache", st.pathU8);
             return false;
         }
         st.bytes = n;
     }
     Unlock();
 
-    ORB_LOG_INFO("TraceFile: 落盘已开 %s（%s，trkeep=%u，上限 %u MB%s）"
-                 "—— **调试完记得删**",
-                 st.pathU8, sig ? sig : "记录日志", keep, capMB,
-                 capMB ? "" : "（不限，注意别写满盘）");
+    ORB_LOG_INFO("TraceFile: 缓存已开 %s（%s，上限 %u MB%s）"
+                 "—— 开新段会自动删掉上一段",
+                 st.pathU8, sig ? sig : "记录 cache", capMB,
+                 capMB ? "" : "（不限；disconnect / reset 时自动删除）");
     return true;
+}
+
+// 把索引还给系统。**只在文件已经关掉之后调用**：`Locate` / `TraceFileNextMark` /
+// `TraceFileRecordsRange` 都以 `st.f != nullptr` 为前提，文件一关索引就不可查了，
+// 留着只是常驻 64 KB ~ 1 MB。pthread/临界区已由调用方持有。
+void DropMarks(FileState& st)
+{
+    free(st.mark);
+    st.mark      = nullptr;
+    st.markCap   = 0;
+    st.markCount = 0;
+    st.markWarned = false;
 }
 
 void CloseFile(FileState& st, const char* what, const char* why)
@@ -265,12 +290,12 @@ void CloseFile(FileState& st, const char* what, const char* why)
     st.f = nullptr;
 
     const bool failed = st.failed;
-    ORB_LOG_INFO("TraceFile: %s 已关闭(%s) %s —— %llu 字节%s，索引 %u 条%s。"
-                 "**调试完记得删**",
+    ORB_LOG_INFO("TraceFile: %s 已关闭(%s) %s —— %llu 字节%s，索引 %u 条%s"
+                 "（disconnect / reset 时自动删除）",
                  what, why ? why : "?", st.pathU8, st.bytes,
                  (st.raw || st.frames) ? "" : "",
                  st.markCount,
-                 st.markWarned ? "（索引已满，只留了最早的）" : "");
+                 st.markWarned ? "（索引到上限，之后的数据没有索引）" : "");
     if (st.raw || st.frames) {
         ORB_LOG_INFO("TraceFile: %s 明细 —— 原样 %llu 字节 + 编码 %llu 帧",
                      what, st.raw, st.frames);
@@ -278,6 +303,9 @@ void CloseFile(FileState& st, const char* what, const char* why)
     if (failed) {
         ORB_LOG_WARN("TraceFile: %s 中途写失败过 —— 文件可能不完整", what);
     }
+        // 日志里要的 `markCount` / `markWarned` 已经用完，索引可以丢了（disconnect
+        // 之后文件马上被 PruneLeftovers 删掉，索引留着没有任何用途）。
+    DropMarks(st);
     Unlock();
 }
 
@@ -306,7 +334,7 @@ bool CloseAndDeleteFile(FileState& st, const char* what, const char* why)
         }
     }
 
-    // 归零。`markCount` 就是记录日志的查询索引（P2-2），一并丢 —— 与
+    // 归零。`markCount` 就是记录 cache 的查询索引（P2-2），一并丢 —— 与
     // `TraceFileClearRecords()` 等价，但这里连文件都不在了，必须一起清。
     st.pathW[0]  = 0;
     st.pathU8[0] = 0;
@@ -315,8 +343,11 @@ bool CloseAndDeleteFile(FileState& st, const char* what, const char* why)
     st.frames    = 0;
     st.failed    = false;
     st.capWarned = false;
-    st.markCount = 0;
-    st.markWarned = false;
+    st.capped    = false;
+    st.capTaken  = false;
+        // 索引数组一起还给系统：下一次 OpenFile 从 64 KB 重新长，不把上一段的
+        // 1 MB 常驻在进程里（这段文件已经不在了，索引留着也没有意义）。
+    DropMarks(st);
     Unlock();
     return removed;
 }
@@ -336,12 +367,16 @@ void WriteBytes(FileState& st, const uint8_t* p, unsigned n, bool raw)
                              "（要更长就调大上限，或分段采集）",
                              st.pathU8, (unsigned long long)(st.capBytes >> 20));
             }
+            // ★ 到顶就不"可用"了：调用方（TraceWin）据 `RecordsActive()` 决定
+            //   继续送块还是转走"丢历史"那条路（ERROR + Data Overflow）。
+            //   只置 `capped` 不置 `failed`：这是有意停的，不是写坏。
+            st.capped = true;
             Unlock();
             return;
         }
         if (fwrite(p, 1, n, st.f) != n) {
             st.failed = true;
-            ORB_LOG_WARN("TraceFile: 写失败（%s），落盘停止", st.pathU8);
+            ORB_LOG_WARN("TraceFile: 写失败（%s），cache 停止", st.pathU8);
         } else {
             st.bytes += n;
             if (raw) st.raw += n;
@@ -350,18 +385,39 @@ void WriteBytes(FileState& st, const uint8_t* p, unsigned n, bool raw)
     Unlock();
 }
 
+// 索引扩容：满时翻倍（64 KB → 1 MB）。false = 已到上限或分配失败。
+// 只在 Mark() 里调用，调用方已持 Lock。
+bool GrowMarks(FileState& st)
+{
+    if (st.markCap >= kMarkMaxTotal) return false;
+    unsigned want = st.markCap ? st.markCap * 2u : kMarkInit;
+    if (want > kMarkMaxTotal) want = kMarkMaxTotal;
+
+    Mark* p = static_cast<Mark*>(realloc(st.mark, sizeof(Mark) * want));
+    if (!p) return false;          // 内存不足：停在当前容量，退回"只 warn 一次"
+    st.mark    = p;
+    st.markCap = want;
+    return true;
+}
+
 void Mark(FileState& st, uint64_t cycle)
 {
     Lock();
-    if (st.f && !st.failed) {
-        if (st.markCount < kMarkMax) {
+    // 到顶后 `st.bytes` 不再增长，继续记索引只会让一批周期号指向同一个偏移
+    // （回放定位全乱）。索引也一起停在顶部。
+    if (st.f && !st.failed && !st.capped) {
+            // 满了先扩容（64 KB → 1 MB），扩不动才算真满。
+        if (st.markCount == st.markCap) GrowMarks(st);
+
+        if (st.markCount < st.markCap) {
             st.mark[st.markCount].ofs   = st.bytes;
             st.mark[st.markCount].cycle = cycle;
             ++st.markCount;
         } else if (!st.markWarned) {
             st.markWarned = true;
-            ORB_LOG_WARN("TraceFile: 索引已满（%u 条）—— 文件仍然完整，但更早的区域"
-                         "没有索引可查", kMarkMax);
+            ORB_LOG_WARN("TraceFile: 索引已到上限（%u 条 / 已写 %llu MB）—— 文件仍然完整，"
+                         "但再往后的区域没有索引可查（回放会变慢）",
+                         st.markCap, st.bytes >> 20);
         }
     }
     Unlock();
@@ -437,27 +493,27 @@ unsigned OflowEncodeFrame(uint8_t tag, const uint8_t* payload, unsigned len, uin
 // 打开 / 关闭
 // ===========================================================================
 
-bool TraceFileOpen(const char* path, unsigned keep, unsigned capMB)
+bool TraceFileOpen(const char* path, unsigned capMB)
 {
-    return OpenFile(s_ofl, path, keep, capMB, L"ORB_trace", L"orb", kOflowSig);
+    return OpenFile(s_ofl, path, capMB, L"ORB_trace", L"orb", kOflowSig);
 }
 
-bool TraceFileOpenRecords(const char* path, unsigned keep, unsigned capMB)
+bool TraceFileOpenRecords(const char* path, unsigned capMB)
 {
-    return OpenFile(s_rec, path, keep, capMB, L"ORB_rec", L"trc", nullptr);
+    return OpenFile(s_rec, path, capMB, L"ORB_rec", L"trc", nullptr);
 }
 
 void TraceFileClose(const char* why)
 {
     CloseFile(s_ofl, "OFLOW 文件", why);
-    CloseFile(s_rec, "记录日志", why);
+    CloseFile(s_rec, "记录 cache", why);
 }
 
 unsigned TraceFileCloseAndDelete(const char* why)
 {
     unsigned n = 0;
     if (CloseAndDeleteFile(s_ofl, "OFLOW 文件", why)) ++n;
-    if (CloseAndDeleteFile(s_rec, "记录日志", why)) ++n;
+    if (CloseAndDeleteFile(s_rec, "记录 cache", why)) ++n;
     if (n) {
         ORB_LOG_INFO("TraceFile: reset 清理 —— 删掉 %u 个缓存文件（%s）", n,
                      why ? why : "?");
@@ -476,12 +532,21 @@ bool TraceFileActive()
 bool TraceFileRecordsActive()
 {
     Lock();
-    // `failed` 也要算"不成立"：写失败之后 `WriteBytes` 直接跳过，再往里送块
-    // 等于把历史丢掉却不吭声 —— 调用方（TraceWin 的内存满分支）要靠这个返回
-    // 值去置 `kTErrDataOvf`。
-    const bool a = (s_rec.f != nullptr) && !s_rec.failed;
+    // `failed` / `capped` 都要算"不成立"：写失败或到顶之后 `WriteBytes` 直接跳过，
+    // 再往里送块等于把历史丢掉却不吭声 —— 调用方（TraceWin 的内存满分支）要靠
+    // 这个返回值去置 `kTErrDataOvf`、记 `丢历史`。
+    const bool a = (s_rec.f != nullptr) && !s_rec.failed && !s_rec.capped;
     Unlock();
     return a;
+}
+
+bool TraceFileTakeCapNotice()
+{
+    Lock();
+    const bool take = (s_rec.f != nullptr) && s_rec.capped && !s_rec.capTaken;
+    if (take) s_rec.capTaken = true;
+    Unlock();
+    return take;
 }
 
 const char* TraceFilePath()
@@ -519,11 +584,12 @@ void TraceFileWriteStream(uint8_t tag, const uint8_t* p, unsigned n)
                                  s_ofl.pathU8,
                                  (unsigned long long)(s_ofl.capBytes >> 20));
                 }
+                s_ofl.capped = true;
                 break;
             }
             if (fwrite(enc, 1, e, s_ofl.f) != e) {
                 s_ofl.failed = true;
-                ORB_LOG_WARN("TraceFile: 写失败（%s），落盘停止", s_ofl.pathU8);
+                ORB_LOG_WARN("TraceFile: 写失败（%s），cache 停止", s_ofl.pathU8);
                 break;
             }
             s_ofl.bytes += e;
@@ -555,7 +621,7 @@ void TraceFileLog(const char* where)
     Unlock();
 
     if (!on) {
-        ORB_LOG_INFO("TraceFile(%s): 未落盘（选项 trfile= 没开）", where ? where : "?");
+        ORB_LOG_INFO("TraceFile(%s): 未写 cache（选项 trfile= 没开）", where ? where : "?");
         return;
     }
     ORB_LOG_INFO("TraceFile(%s): %s —— %llu 字节（原样 %llu + 编码 %llu 帧），"
@@ -565,7 +631,7 @@ void TraceFileLog(const char* where)
 }
 
 // ===========================================================================
-// 记录日志（P2-2）
+// 记录 cache（P2-2）
 // ===========================================================================
 
 void TraceFileWriteRecords(const uint8_t* p, unsigned n)
@@ -647,7 +713,7 @@ void TraceFileClearRecords()
         // 文件是 append-only 的，**旧字节不回收**（也没法回收：文件正在被追加）。
         // 丢掉的只是"可达性"：索引一清，那些周期号就再也定位不到了。
         // 下一次追加从当前文件位置继续记索引，所以新旧两段不会串起来。
-        ORB_LOG_INFO("TraceFile: 记录日志的可查历史已清空（丢下 %u 条索引；"
+        ORB_LOG_INFO("TraceFile: 记录 cache 的可查历史已清空（丢下 %u 条索引；"
                      "文件字节不回收，下次追加从当前位置继续）", had);
     }
 }
@@ -664,11 +730,26 @@ void TraceFileLogRecords(const char* where)
     Unlock();
 
     if (!on) {
-        ORB_LOG_INFO("TraceFile(%s): 无记录日志（选项 trrec= 没开）", where ? where : "?");
+        ORB_LOG_INFO("TraceFile(%s): 无记录 cache（选项 trrec= 没开）", where ? where : "?");
         return;
     }
-    ORB_LOG_INFO("TraceFile(%s): 记录日志 %s —— %llu 字节，索引 %u 条 [周期 %llu..%llu]",
+    ORB_LOG_INFO("TraceFile(%s): 记录 cache %s —— %llu 字节，索引 %u 条 [周期 %llu..%llu]",
                  where ? where : "?", path, bytes, nMark, first, last);
+}
+
+unsigned TraceFilePruneLeftovers(const char* why)
+{
+    // 删的是**日志目录**里的残留（和 ORB_AGDI.log 同一处，默认 %TEMP%）。
+    // 会话结束时索引已经清空、文件不可查，留着只是占盘 —— 所以 disconnect
+    // 之后与下一次 Connect 之前都无条件清一遍，不依赖"下次还开 cache"。
+    const std::wstring dir = LogDir();
+    unsigned n = PruneOld(dir, L"ORB_rec",   L"trc");
+    n += PruneOld(dir, L"ORB_trace", L"orb");
+    if (n) {
+        ORB_LOG_INFO("TraceFile: 清理残留 —— 删掉 %u 个上一次会话的 cache 文件（%s）",
+                     n, why ? why : "?");
+    }
+    return n;
 }
 
 } // namespace agdi

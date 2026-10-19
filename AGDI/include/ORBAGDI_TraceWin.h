@@ -105,7 +105,7 @@ void TraceWinSetTimestampsVisible(bool on);
 // 清空记录（ClearTrace / 会话开始）；内部先 Drain，避免块双重归属。
 void TraceWinClear();
 
-// 等后台落盘线程把在飞的块写完并还回空闲链；会等待但不持结构锁。
+// 等后台 cache 写线程把在飞的块写完并还回空闲链；会等待但不持结构锁。
 void TraceWinDrain();
 
 // 让所有 trace 视图定位到 cycle（UV_TRACE_WIN_SYNC）。

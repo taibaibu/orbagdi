@@ -6,6 +6,7 @@
 #include "pch.h"
 #include "ORBAGDI_Agdi.h"
 #include "ORBAGDI_CodeImage.h"
+#include "ORBAGDI_Cover.h"       // 代码覆盖 / 性能分析（AG_F_COVERAGE、AG_PROFILEINFO）
 #include "ORBAGDI_DebugAccess.h"
 #include "ORBAGDI_Etb.h"
 #include "ORBAGDI_Etm.h"
@@ -65,54 +66,21 @@ SUPP g_supp;   // (re)filled by AG_Init(AG_INITFEATURES)
 
 namespace {
 
-// 4 字节粒度地址 → 属性字。
-// 必须是 DWORD：AG_GETMEMATT 把指针交给 uVision，它按 DWORD* 解引用。
-struct AttrStore {
-    CRITICAL_SECTION             cs;
-    std::map<uint32_t, uint32_t> m;
-    AttrStore() { InitializeCriticalSection(&cs); }
-};
+// 属性字（4 字节粒度）只存**一份**：ORBAGDI_Cover 的 64 kB 段数组。
+//
+// DbgCM 里 MGetAttr（AG_GETMEMATT 用）、MGetAttr16、AG_GETATTRSEG 全部落在同一块
+// `acc.atr[]` 上；uVision 的覆盖率窗口是拿 GETMEMATT 的指针逐地址读 EXECD/EXECDO 的，
+// AG_GETATTRSEG 只在 coverage 文件 load/save 时用（官方注释
+// "Attribute segment required for coverage load/save"）。
+// 之前这里用 std::map 另存一份、段数组只给 GETATTRSEG —— 两边不同源，
+// 窗口读到的那份永远没有执行位，于是"都是 0/指令"。
+uint32_t  AttrGet(uint32_t adr)              { return orb::cover::AttrGet(adr); }
+void      AttrSet(uint32_t adr, uint32_t v)  { orb::cover::AttrSet(adr, v); }
+uint32_t* AttrPtr(uint32_t adr)              { return orb::cover::AttrPtr(adr); }
 
-AttrStore& Attrs() {
-    static AttrStore s;   // C++11 magic static: thread-safe construction
-    return s;
-}
-
-uint32_t AttrGet(uint32_t adr) {
-    AttrStore& a = Attrs();
-    EnterCriticalSection(&a.cs);
-    const std::map<uint32_t, uint32_t>::const_iterator it = a.m.find(adr & ~3u);
-    const uint32_t v = (it == a.m.end()) ? 0 : it->second;
-    LeaveCriticalSection(&a.cs);
-    return v;
-}
-
-void AttrSet(uint32_t adr, uint32_t v) {
-    AttrStore& a = Attrs();
-    EnterCriticalSection(&a.cs);
-    a.m[adr & ~3u] = v;
-    LeaveCriticalSection(&a.cs);
-}
-
-/// 'adr' 属性字的稳定指针（进程生命期内有效，见 AttrClear()）。
-uint32_t* AttrPtr(uint32_t adr) {
-    AttrStore& a = Attrs();
-    EnterCriticalSection(&a.cs);
-    uint32_t* p = &a.m[adr & ~3u];
-    LeaveCriticalSection(&a.cs);
-    return p;
-}
-
-void AttrClear() {
-    AttrStore& a = Attrs();
-    EnterCriticalSection(&a.cs);
-        // 清零而不擦除节点：AG_GETMEMATT 已把指针交给 uVision，删节点会留下悬空指针。
-        // 因此增长只受 uVision 实际设置过属性的地址数限制。
-    for (std::map<uint32_t, uint32_t>::iterator it = a.m.begin(); it != a.m.end(); ++it) {
-        it->second = 0;
-    }
-    LeaveCriticalSection(&a.cs);
-}
+// 只清断点/观察位：这里既被 AG_BPKILLALL 调（用户删全部断点），也被会话结束调，
+// 清全字会顺手把覆盖率清掉（删断点后覆盖率变 0）。执行位与计数保留。
+void AttrClear()                             { orb::cover::AttrClearBp(); }
 
 // uVision 通过 AG_MemAtt(AG_MEMMAP) 映射的内存窗口。
 // 只存区间：属性字在 AttrStore，区间回答 AG_CADRVALID 的“是否已映射”。
@@ -323,9 +291,26 @@ static bool TraceSourceActive() {
            (EtbAvailable() && EtbGetStatus().configured);
 }
 
+/// 记录 cache 到顶（trrecmb=）时弹一次框：文件已停止追加，只有内存窗口里那一段
+/// 还能查。`TakeCapNotice` 取一次即复位，所以一个会话只弹一次。
+/// 走宿主的 AG_CB_MSGBOX（与官方 DbgCM 的 AGDIMsgBox 同一套）—— 自己
+/// MessageBoxA 会把框弹在不泵消息的线程后面。
+static void TraceCacheCapNotice() {
+    if (!orb::agdi::TraceFileTakeCapNotice()) return;
+    Context& c = Get();
+    AGDIMsgBox(c.mainFrame,
+               "The trace cache file reached its size limit (trrecmb=) and stopped growing.\n"
+               "Records older than the in-memory window are no longer kept -- "
+               "raise the limit for a longer capture.",
+               "ORBAGDI - trace cache full", MB_OK | MB_ICONWARNING, IDOK);
+}
+
 // 窗口“Update”：把源里剩下的取干净（ETB 重读目标缓冲，orbtrace 再排空端点）。
 static bool TraceWinRefresh() {
     Context& c = Get();
+
+        // 刷新是 uVision 的 UI 线程，正好是弹框的时机。
+    TraceCacheCapNotice();
 
         // 流式源不在窗口线程上抽干：抽数已移到 worker，这里再抽会把环里积压的
         // 几十万条一次灌进窗口、覆写正在显示的那批。ETB 是停机后读回，仍在此做。
@@ -429,33 +414,36 @@ static bool ReadMemForCodeImage(void* ctx, uint32_t addr, uint8_t* out, unsigned
     return d && d->IsConnected() && d->MemRead(addr, out, len);
 }
 
-/// 按配置打开两份落盘文件（trfile= / trrec=，默认都关）。
+/// 按配置打开两份 cache 文件（trfile= / trrec=，默认都关）。
 /// 有两个调用点（Connect 与 reset 清理），必须用同一套规则。
 static void TraceFileOpenFromConfig()
 {
     const orb::cfg::Config& tc = orb::cfg::Get();
-        // 落盘都是 opt-in：trfile= 未给即关；trrec=1 = %TEMP% 下自动命名。
-        // 写盘已在后台线程，不再卡抽数；trrecmb= 给上限，默认 2 GB。
+        // cache 都是 opt-in：trfile= 未给即关；trrec=1 = %TEMP% 下自动命名。
+        // 写盘已在后台线程，不再卡抽数；trrecmb= 给上限，默认 0 = 不限
+        // （默认 2 GB 会让文件在中途冻结、内存继续滚动，时间轴中间留空洞）。
     const unsigned capMB = tc.trRecMB > 0 ? static_cast<unsigned>(tc.trRecMB) : 0u;
-    const unsigned keep  = tc.trKeep > 0 ? static_cast<unsigned>(tc.trKeep) : 0u;
-    orb::agdi::TraceFileOpen(tc.trFile, keep, capMB);
-    // 记录日志（P2-2）：内存窗口之外能回看的那一份（紧凑记录，查询不重解）。
-    orb::agdi::TraceFileOpenRecords(tc.trRec, keep, capMB);
+    orb::agdi::TraceFileOpen(tc.trFile, capMB);
+    // 记录 cache（P2-2）：内存窗口之外能回看的那一份（紧凑记录，查询不重解）。
+    orb::agdi::TraceFileOpenRecords(tc.trRec, capMB);
 }
 
-/// 从头开始：作废上一轮的 trace 数据（内存缓冲、周期轴基准、导航分片、落盘缓存）。
+/// 从头开始：作废上一轮的 trace 数据（内存缓冲、周期轴基准、导航分片、cache 文件）。
 /// 顺序必须是先关删文件、再清内存、最后重开，否则重开的文件会被刚删掉。
-/// 挂点只有 Connect 与 AG_RESET 两个事件，不对应菜单操作。
+/// 挂点只有 Connect 一处（AG_RESET 不清 trace，见 AG_RESET 分支里的说明），不对应菜单操作。
 static void TraceResetForTarget(const char* why)
 {
     const unsigned nFiles = orb::agdi::TraceFileCloseAndDelete(why);
+        // 无条件清残留：上一次会话的文件在 disconnect 时已经不可查（索引已清），
+        // 留着只是占盘。不依赖"本次还开 cache"—— 不开也要删。
+    const unsigned nLeft = orb::agdi::TraceFilePruneLeftovers(why);
     orb::agdi::TraceWinClear();
         // 清空/复位不是 run 状态变化（SetRunning 会早退），故在这里补一次时钟重发。
     orb::agdi::RefreshTraceClocks();
     TraceFileOpenFromConfig();
-    ORB_LOG_INFO("AGDI: trace 已按 reset 语义清空（%s）—— 落盘缓存删掉 %u 个，"
+    ORB_LOG_INFO("AGDI: trace 已按 reset 语义清空（%s）—— cache 文件删掉 %u 个 + 残留 %u 个，"
                  "内存缓冲与周期轴已归零",
-                 why ? why : "?", nFiles);
+                 why ? why : "?", nFiles, nLeft);
 }
 
 /// 复位后重新武装目标侧 trace（复位清掉了 TRCENA/TPIU/ITM/DWT/ETMCR 与 TraceStart）。
@@ -598,14 +586,14 @@ bool Connect() {
         // 放在 EtmTraceReset() 之后：读不到 CPUID 时保持默认。
     EtmTraceSelectProtocol(c.dap);
         // 记录缓冲规模必须在 TraceWinInit() 之前给：上限决定一次性分配的索引数组。
-        // 默认 4 MB/块、上限物理内存 1/4 封顶 1 GB；trmax= 默认 0 = 不限条数。
+        // 默认 4 MB/块、上限物理内存 1/4 封顶 256 MB；trmax= 默认 0 = 不限条数。
     {
         const orb::cfg::Config& tc = orb::cfg::Get();
         TraceWinSetBuffer(tc.trChunkMB > 0 ? static_cast<unsigned>(tc.trChunkMB) : 0u,
                           tc.trMemMB   > 0 ? static_cast<unsigned>(tc.trMemMB)   : 0u,
                           tc.trMaxRecs > 0 ? static_cast<unsigned long long>(tc.trMaxRecs) : 0ull);
     }
-    // 新会话 = 从头开始：清内存缓冲、删掉上一轮的落盘缓存、按配置重开新文件。
+    // 新会话 = 从头开始：清内存缓冲、删掉上一轮的 cache 文件、按配置重开新文件。
     // 顺序与理由见 TraceResetForTarget()（**先关删，再清内存，最后重开**）。
     TraceResetForTarget("connect");
 
@@ -788,6 +776,10 @@ bool StopTraceSources(const char* why) {
                  why ? why : "?", (int)OrbTraceActive(), (int)ItmActive(),
                  (int)etbArmed);
 
+    // 拿锁**之前**先让 worker 把探针环里剩下的抽空：持锁等它只会等到超时，
+    // 尾巴就落在"窗口已按旧区间报过"之后（同 RunAndWait 停机路径）。
+    if (TracePumpRunning()) TracePumpDrainOnce(1000);
+
     // 停源要碰探针。拿不到锁就不硬来：断开那一路会无条件收尾，而且此时硬等只会
     // 让设置页按钮看起来卡住。
     ComLockWait lock(500);
@@ -795,6 +787,13 @@ bool StopTraceSources(const char* why) {
         ORB_LOG_WARN("Trace: 收源时拿不到探针锁（%s），留待 Disconnect 收尾",
                      why ? why : "?");
         return false;
+    }
+
+    // 先让解码线程追平再打汇总：抽数线程此刻拿不到探针锁，队列里不会再有新块进来，
+    // 而 OrbTraceStop() 里的"解码结果 / ETM 汇总"必须在排空之后打 —— 否则计数偏小，
+    // 出现"汇总 0 条而窗口有数据"（Todo §3.1 要点 4）。
+    if (!TracePumpSync(1000)) {
+        ORB_LOG_WARN("Trace: 收源前解码队列 1 s 内未排空 —— 下面的汇总计数会偏小");
     }
 
     // 状态通知放在**拿到锁之后**：拿不到锁时干脆别动窗口，否则会留下"窗口说已
@@ -815,6 +814,9 @@ void Disconnect() {
     // 先置标志：让后台恢复撒手、让出探针锁，否则下面每一步都卡在死链路上。
     InterlockedExchange(&c.uninitReq, 1);
 
+    // 停 worker 之前把环里剩下的抽回来（同 RunAndWait）；探针可能已死，所以只等 500 ms。
+    if (TracePumpRunning()) TracePumpDrainOnce(500);
+
     TraceSetRunning(false, false);
     // **先**停 worker，再拆源：否则它会一边被拆一边读探针。
     TracePumpStop();
@@ -824,11 +826,16 @@ void Disconnect() {
         // ETM 继续全速灌 trace 而无人排空，缓冲溢出后数据错乱。
     ItmTraceOff(c.dap);
     if (EtbAvailable()) EtbReset();
-    // 落盘（P3-1）：抽数已停，但**退休队列里可能还有在飞的块**（写线程正在写）。
+    // cache（P3-1）：抽数已停，但**退休队列里可能还有在飞的块**（写线程正在写）。
     // 必须等它们落完 —— 下一句 `TraceFileClose()` 一关文件，队列里没写的块就只能丢。
     TraceWinDrain();
-    // 落盘（P2-1）：三条源都已停，这里收尾并打一行汇总（路径/字节/索引条数）。
+    // cache（P2-1）：三条源都已停，这里收尾并打一行汇总（路径/字节/索引条数）。
+    // 会话里从没刷新过窗口时，到顶提示在这里补一次（取过就不再弹）。
+    TraceCacheCapNotice();
     TraceFileClose("disconnect");
+        // **关闭即清理**：`TraceFileClose` 已经把索引清空，文件此后不可查，
+        // 留着的唯一结果就是下次会话前一直占着几个 GB。这里无条件删掉。
+    orb::agdi::TraceFilePruneLeftovers("disconnect");
     TraceWinShutdown();
 
     // Let the description clean up after itself while the port still answers.
@@ -1242,6 +1249,19 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
     InterlockedExchange(&c.running, 0);
     if (tempIsNew) c.bps.Remove(temp);
 
+        // ⚠ 顺序要紧：**先**让 worker 把探针环里最后一段抽空，**再**独占探针。
+        // 反过来（持锁再等）worker 根本抽不到 —— TracePumpSync 只看队列深度，会立刻
+        // 返回，于是停机那一刻还在环里的字节要等到锁释放后才进 store。实测两处症状：
+        //   · "跑到断点/停下后 Trace 窗口空白、导航空"（上报区间时 store 还是 0 条）；
+        //   · "那一段以后也找不回来"（uVision 已按空区间取过数，不再来问）。
+        // 停机路径上这批尾巴有实测 56333 条，占据到停止后 5 s 才被查询看到。
+    if (TracePumpRunning()) {
+        if (!TracePumpDrainOnce(1000)) {
+            ORB_LOG_WARN("GoStep: 停机前抽数线程 1 s 内没抽空探针环 —— "
+                         "Trace 的尾部可能缺失");
+        }
+    }
+
         // 停机收尾要碰目标（DFSR/PC/ETB），重新独占探针；worker 时间片只有 2 ms。
     ComLockWait stopLock(500);
     if (!stopLock.Held()) {
@@ -1271,14 +1291,24 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
                      dfsr, w ? why : " none");
 
                 // 向量捕获 = 停在 fault 处理里，读 fault 状态寄存器才能知道是哪个 fault。
+                // ⚠ VCATCH 只是"停止原因"的一个位，不等于真的发生了 fault：调试器自己设的
+                // 向量捕获（uVision 的 HardFault/Fault 选项）也会置它，此时 CFSR/HFSR 全 0。
+                // 只有 CFSR/HFSR 非零才是硬件 fault —— 否则 BFAR/MMFAR 是无意义值，打 WARN
+                // 会让用户去追一个不存在的故障（实测 DFSR=0x0A 的普通 BKPT 停止就被报成 fault）。
         if (dfsr & 0x08u) {
             uint32_t cfsr = 0, hfsr = 0, bfar = 0, mmfar = 0;
             c.dap.MemRead32(0xE000ED28u, cfsr);    // CFSR (MMFSR | BFSR | UFSR)
             c.dap.MemRead32(0xE000ED2Cu, hfsr);    // HFSR
             c.dap.MemRead32(0xE000ED38u, bfar);    // BFAR
             c.dap.MemRead32(0xE000ED34u, mmfar);   // MMFAR
-            ORB_LOG_WARN("GoStep: fault - CFSR=0x%08X HFSR=0x%08X BFAR=0x%08X "
-                         "MMFAR=0x%08X", cfsr, hfsr, bfar, mmfar);
+            if (cfsr || hfsr) {
+                ORB_LOG_WARN("GoStep: fault - CFSR=0x%08X HFSR=0x%08X BFAR=0x%08X "
+                             "MMFAR=0x%08X", cfsr, hfsr, bfar, mmfar);
+            } else {
+                ORB_LOG_INFO("GoStep: 停在向量捕获（VCATCH），但 CFSR=0 HFSR=0 —— "
+                             "没有硬件 fault 状态；BFAR/MMFAR 读到的 0x%08X/0x%08X 无效"
+                             "（多半是调试器设的向量捕获，或已清过状态）", bfar, mmfar);
+            }
         }
 
                 // DFSR 是写 1 清零；不清会把上次的原因带到下一次。
@@ -1288,9 +1318,13 @@ U32 RunAndWait(uint32_t tempBpAddr, uint32_t timeoutMs, uint32_t* stopAddr) {
     // Read out and decode the ETB now that the target has stopped.
     if (etb) EtbProcess(c.dap);
 
-        // 最后一次排空：停机前沿路的缓存，此时调试线程仍独占探针。
-    OrbTracePump(c.dap, 5);
-    ItmPump(c.dap, 5);
+        // worker 在跑时，最后一段已经在**拿锁之前**由 TracePumpDrainOnce() 抽干并解完
+        // （见上面那处调用）；这里再抽也抽不到，反而会和解码线程抢顺序。
+        // ⚠ 调试线程自己解会插到积压之前，解码器状态乱序（Todo §3.1 要点 3）。
+    if (!TracePumpRunning()) {
+        OrbTracePump(c.dap, 5);        // 独占模式（worker 没起来）才由这里同步抽+解
+        ItmPump(c.dap, 5);
+    }
     TraceSetRunning(false, true);
 
         // PC 只在停机时有意义：DCRDR 保存上次传输的残值（实测读到过 DHCSR 的值），
@@ -1722,7 +1756,7 @@ void RegGet(RITEM* vp, int nR) {
 }
 
 // 写 FPU 条目；不属 FPU 段返回 false，交给后面的核心寄存器 switch。
-// D 视图按两个单精度寄存器落盘，与官方一致（不给 DCRSR 造 64 位选择子）。
+// D 视图按两个单精度寄存器写入，与官方一致（不给 DCRSR 造 64 位选择子）。
 bool WriteFpuItem(orb::agdi::Context& c, const RITEM* vp, const GVAL* pV, bool& ok) {
     ok = false;
     const U16 id = vp->nItem;
@@ -1904,10 +1938,15 @@ void ReportSession() {
     const orb::cfg::Config& raw = orb::cfg::Get();
     const orb::cfg::Config  eff = orb::cfg::Effective();
 
+        // ⚠ 器件名与 Flash 范围取 **eff**，不是 raw：uVision 的 dbgblk 通常不填这两个字段
+        // （选项串里只有 flm=/ram=/clock=），器件信息是由 PDSC 自动识别后写进 AutoDetected()、
+        // 再由 Effective() 补上的。原来用 raw ⇒ 横幅恒为 "0 kB flash at 0x00000000"，
+        // 而同一份日志的 Cfg 行明明已经识别出器件与 IROM 0x08000000+0x80000。
+    const char* dev = eff.device[0] ? eff.device
+                    : (raw.device[0] ? raw.device : "(device not named by uVision)");
     orb::ui::Info("ORBAGDI %s - %s, %u kB flash at 0x%08X",
-                  ORBAGDI_VERSION_STRING,
-                  raw.device[0] ? raw.device : "(device not named by uVision)",
-                  raw.iromSize / 1024u, raw.iromStart);
+                  ORBAGDI_VERSION_STRING, dev,
+                  eff.iromSize / 1024u, eff.iromStart);
 
     orb::ui::Info("  RDDI host : %s",
                   eff.rddiDll[0] ? eff.rddiDll : "(none - see the log)");
@@ -2155,6 +2194,15 @@ U32 AG_Init(U16 nCode, void *vp)
         orb::agdi::g_supp.ResetR  = 1;
                 // 数据观察点由 DWT 比较器承担；ExtBrkSupp 让 uVision 通过 AG_BreakFunc 交来断点表。
         orb::agdi::g_supp.ExtBrkSupp = 1;
+                // 代码覆盖：执行过的地址由 ETM 解码时标进属性段（AG_GETATTRSEG 返回的
+                // 64 kB 段数组，见 ORBAGDI_Cover.cpp）。没有 ETM 指令 trace 时覆盖率
+                // 恒为空 —— 那是数据源限制，不是没实现。
+        orb::agdi::g_supp.hCover = 1;
+                // 新会话从零开始：上一会话的执行位与性能计数不能混进这一次的报告。
+                // 段表保留（uVision 已经拿过指针），只清内容。
+        orb::cover::Clear();
+        ORB_LOG_INFO("Init: 覆盖率/性能计数已清零（复用 %u 段）",
+                     orb::cover::SegmentCount());
                 // ITM/SWO 控制台 + PC 采样历史 + Trace Data 窗口，只在工程启用了源时声明，
                 // 否则窗口不出现、也不占目标引脚。历史是统计采样，不是全指令 trace。
         {
@@ -2162,7 +2210,7 @@ U32 AG_Init(U16 nCode, void *vp)
             if (opt.swoBaud > 0 || opt.traceClockKhz > 0 || opt.etb || opt.orbtrace) {
                 orb::agdi::g_supp.ItmTrace = 1;   // ITM + DWT trace support
                 orb::agdi::g_supp.hTrace   = 1;   // trace recording / Trace window
-                orb::agdi::g_supp.hPaLyze  = 1;   // statistical PC profile
+                orb::agdi::g_supp.hPaLyze  = 1;   // UlPro profiling（AG_PROFILEINFO）
             }
         }
         if (vp) *static_cast<SUPP *>(vp) = orb::agdi::g_supp;
@@ -2372,6 +2420,60 @@ U32 AG_Init(U16 nCode, void *vp)
             }
             break;
         }
+        case AG_PROFILEINFO: {   // 0x0016 - UlPro-Profiling：性能分析器按地址范围取数
+                        // 数据来源与覆盖率同一处（ETM 解码时按地址累计的执行次数，见
+                        // ORBAGDI_Cover.cpp）。周期轴是"每条指令 +1"，所以 cycles 与
+                        // count 同值：**相对耗时可信，绝对时间只是 指令数/主频**，
+                        // 不追墙钟 —— 这块板子的 ETM 没有时间戳包（日志里
+                        // `真实周期轴=0 来源=none`），拿不到真实 CPI。
+            AG_PROFINFO* pf = static_cast<AG_PROFINFO*>(vp);
+            if (!pf) return AG_PROFINFO_BAD;
+
+            const orb::cfg::Config& opt = orb::cfg::Effective();
+            const uint32_t coreHz = (opt.cpuKhz > 0)
+                                        ? static_cast<uint32_t>(opt.cpuKhz) * 1000u
+                                        : 0u;
+
+            U32 rc = AG_PROFINFO_OK;
+            switch (pf->nCmd) {
+            case AG_PROF_TOTALCYCLES:
+                pf->cycles = orb::agdi::TraceWinLastCycle();
+                pf->count  = 0;
+                pf->time   = coreHz ? static_cast<double>(pf->cycles) / coreHz : 0.0;
+                break;
+            case AG_PROF_CALCCYCLES:
+                pf->cycles = orb::cover::ExecCountRange(pf->nStart, pf->nEnd);
+                pf->count  = pf->cycles;
+                pf->time   = coreHz ? static_cast<double>(pf->cycles) / coreHz : 0.0;
+                break;
+            case AG_PROF_EXECCOUNT:
+                pf->count  = orb::cover::ExecCount(pf->nStart);
+                pf->cycles = 0;
+                pf->time   = 0.0;
+                break;
+            case AG_PROF_ADDINFO:
+                                // uVision 把外部计数器推进来；我们的数在解码时已在线累计。
+                rc = AG_PROFINFO_NP;
+                break;
+            default:
+                rc = AG_PROFINFO_NP;
+                break;
+            }
+
+                        // uVision 会对每个函数/PA 点各来一次，全记会淹掉日志。
+            {
+                static volatile LONG s_calls = 0;
+                const LONG n = InterlockedIncrement(&s_calls);
+                if (n <= 3 || (n % 500) == 0) {
+                    ORB_LOG_INFO("AGDI: AG_PROFILEINFO(cmd=%d 0x%08X..0x%08X) #%ld "
+                                 "-> rc=%u cycles=%llu count=%llu",
+                                 pf->nCmd, pf->nStart, pf->nEnd, n, rc,
+                                 static_cast<unsigned long long>(pf->cycles),
+                                 static_cast<unsigned long long>(pf->count));
+                }
+            }
+            return rc;
+        }
 
         default:
             break;   // the remaining items are notifications only
@@ -2409,14 +2511,19 @@ U32 AG_MemAtt(U16 nCode, UL32 nAttr, GADR *pA)
     switch (nCode) {
     case AG_MEMMAP:
                 // uVision 告知哪些区间算内存；只记录区间，AG_CADRVALID 要用。
+                // 同时按官方 MMapSeg 的语义把属性写进覆盖率段：段里既有 uVision 给的
+                // 可执行/读写位，也有我们标的 EXECD，覆盖率窗口才拿得到完整信息。
         if (pA) {
             MapMem(pA->Adr, pA->nLen, nAttr);
+            orb::cover::MapSeg(pA->Adr, pA->nLen, nAttr);
             pA->ErrAdr = 0;                // 0 == mapping accepted
         }
         return AG_OK;
 
     case AG_GETMEMATT:
                 // 返回值是**属性字指针**：uVision 按 DWORD* 解引用，返回位掩码会被当指针跟着解。
+                // 这个指针指向覆盖率段数组里的那一项 —— 覆盖率窗口就是拿它读 EXECD 的，
+                // 与 AG_GETATTRSEG 同源（DbgCM 的 MGetAttr 也是同一块 acc.atr[]）。
         if (pA) {
             pA->Adr = static_cast<UL32>(
                 reinterpret_cast<uintptr_t>(AttrPtr(pA->Adr)));
@@ -2424,15 +2531,24 @@ U32 AG_MemAtt(U16 nCode, UL32 nAttr, GADR *pA)
         return AG_OK;
 
     case AG_GETATTRSEG:
-                // 同一描述符按 64 kB 段取，覆盖率加载/保存要的就是它。
+                // coverage 文件 load/save：uVision 要的是**段首指针 + 后面 16384 个
+                // 连续 DWORD**（64 kB 地址空间，4 字节一个属性字），按
+                // `pAttr[(adr>>2) & 0x3FFF]` 索引。与上一分支同一块内存。
         if (pA) {
-            pA->Adr = static_cast<UL32>(
-                reinterpret_cast<uintptr_t>(AttrPtr(pA->Adr & 0xFFFF0000u)));
+            pA->Adr = static_cast<UL32>(reinterpret_cast<uintptr_t>(
+                orb::cover::AttrSeg(pA->Adr & 0xFFFF0000u)));
         }
         return AG_OK;
     case AG_SETMEMATT:
-    case AG_CLEARCOVERAGE:
+                // uVision 从不写属性（DbgCM/AGDI.CPP 里标着 "not used"）；接受即可。
         return AG_OK;
+    case AG_CLEARCOVERAGE: {
+                // "Reset code coverage" 按的这颗：清 EXECD/EXECDO 与性能计数。
+        const unsigned segs = orb::cover::SegmentCount();
+        orb::cover::Clear();
+        ORB_LOG_INFO("MemAtt: AG_CLEARCOVERAGE -> cleared %u segment(s)", segs);
+        return AG_OK;
+    }
     default:
         return AG_INVALOP;
     }
@@ -2776,15 +2892,22 @@ U32 AG_GoStep(U16 nCode, U32 nSteps, GADR *pA)
         }
         InterlockedExchange(&c.running, 0);
 
+        // 先抽干再拿锁，理由同 RunAndWait：持锁等 worker 只会等到超时。
+        if (orb::agdi::TracePumpRunning()) {
+            orb::agdi::TracePumpDrainOnce(1000);
+        }
+
         // 停机收尾：读回 ETB、最后一次排空、发布停止状态，全都要碰目标或探针。
         orb::agdi::ComLockWait stopLock(500);
         // The ETB may have been armed by an earlier run; read it out now.
         if (orb::agdi::EtbAvailable() && orb::agdi::EtbGetStatus().configured) {
             orb::agdi::EtbProcess(c.dap);
         }
-        // Whatever the probe buffered just before the halt.
-        orb::agdi::OrbTracePump(c.dap, 5);
-        orb::agdi::ItmPump(c.dap, 5);
+        // worker 在跑时，最后一段已在拿锁之前抽干（见上）。
+        if (!orb::agdi::TracePumpRunning()) {
+            orb::agdi::OrbTracePump(c.dap, 5);
+            orb::agdi::ItmPump(c.dap, 5);
+        }
         orb::agdi::TraceSetRunning(false, true);
         if (pA) { pA->Adr = orb::agdi::ReadPC(); pA->ErrAdr = 0; }
         return AG_OK;

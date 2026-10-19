@@ -166,8 +166,11 @@ void FillGap(uint32_t from, uint32_t to)
     static ScanBuf buf;                 // 只在抽数 worker 线程上用（16 KB 静态）
     buf.n = 0;
 
-    const ScanResult r = ScanTo(&CodeImageReadThunk, nullptr, from, to,
-                                kMaxScanInstr, &CollectInstr, &buf);
+    // ScanToCached：同一段代码在一次采集里会被反复扫（循环、反复调用），按 pc 缓存
+    // 指令形状后命中路径不读镜像、不进 capstone —— 这是把解码从 106 ms/64 KB 压下来的
+    // 主要手段（见 ORBAGDI_InstrScan.cpp 文件头）。
+    const ScanResult r = ScanToCached(&CodeImageReadThunk, nullptr, from, to,
+                                      kMaxScanInstr, &CollectInstr, &buf);
 
     s.scanInstrs += r.instrs;
 
@@ -264,7 +267,8 @@ void OnReport(void* d)
         // bit8=0 时直接分支不进流，只能靠代码镜像顺序扫（FillGap）。
         // ⚠ 只有解码器已同步时才补：未同步解出的是垃圾地址，拿去读内存会让 MEM-AP 报错、DAP 进
         // 错误态；未同步时连起点都不更新。补出来的指令必须先于分支目标记录，时间轴才对。
-        if (!EtmTraceIsSynced()) {
+        const bool synced = EtmTraceIsSynced();
+        if (!synced) {
             s.haveLastPc = false;
         } else {
             if (s.haveLastPc) FillGap(s.lastPc, cpu->addr);
@@ -275,7 +279,12 @@ void OnReport(void* d)
         // cpu->addr 已经是"Thumb/ARM 模式已处理过"的地址（ISYNC 的 bit0
         // 决定模式，Thumb 时 bit0 被清掉）—— 这一点自研骨架没有做，
         // 也是窗口里地址全是垃圾的原因之一。
-        TraceWinEtmInstruction(cpu->addr, true);
+        //
+        // ⚠ 只在已同步时上报：未同步解出的不是"少一段"，而是**假地址**
+        // （相对地址的基准未知）。头文件那条承诺（"在收到下一个 A-SYNC/ISYNC
+        // 之前不上报地址，假地址比没有地址更糟"）原来漏在这里 —— 假地址不只
+        // 污染 Trace 窗口，还会让覆盖率替它新建一个 64 kB 段。
+        if (synced) TraceWinEtmInstruction(cpu->addr, true);
     }
 
     // ---- 原子（P-header）：哪几条指令执行了、哪几条没执行 ----------------
@@ -506,6 +515,21 @@ void EtmTraceLogSummary(const char* where)
     // 补不出=读不到/解不出/超上限。判据：有镜像时 `补出` 应远大于 `地址`，`补不出` 接近 0。
     ORB_LOG_INFO("ETM: P1-0 全指令 地址=%llu 补出=%llu 闭合=%llu 跳走=%llu 补不出=%llu",
                  s.addresses, s.scanInstrs, s.scanGaps, s.scanBranchOuts, s.scanFails);
+
+    // 指令形状缓存的命中率：P1-0 解码成本几乎全在这里。命中率高而解码仍慢 ⇒
+    // 瓶颈已经不在 ScanTo（去查 TraceWin 的落记录）；命中率低 ⇒ 工作集超过 512 KB
+    // 镜像（RAM 里跑的函数会撞槽），或者镜像在采集期间被反复重建（flushes 大）。
+    {
+        InstrScanCacheStats cs = {};
+        InstrScanGetCacheStats(cs);
+        const double tot = static_cast<double>(cs.hits + cs.misses);
+        ORB_LOG_INFO("InstrScan: 指令缓存 命中=%llu 未命中=%llu 命中率=%.1f%% "
+                     "作废=%llu 槽=%u",
+                     cs.hits, cs.misses,
+                     tot > 0.0 ? 100.0 * static_cast<double>(cs.hits) / tot : 0.0,
+                     cs.flushes, cs.slots);
+    }
+
     CodeImageSummary(where);
 }
 

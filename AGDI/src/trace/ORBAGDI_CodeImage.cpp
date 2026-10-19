@@ -64,11 +64,16 @@ struct State {
     };
     Page page[kPageCount];
 
+    // 镜像内容版本号：每次 code 字节变化（Add / Clear）就 +1。指令扫描的解码缓存
+    // （InstrScan 的 ScanToCached）靠它作废 —— 缓存只存 pc → 指令形状，不存字节，
+    // 字节换了就必须整表丢，否则"下载了新固件、反汇编还是上一版"。
+    volatile LONG gen;
+
     CodeImageStats st;
 
     State()
         : nBlk(0), bytes(0), warnedFull(false), memFn(nullptr), memCtx(nullptr),
-          memDisabled(false), warnDisabled(false)
+          memDisabled(false), warnDisabled(false), gen(0)
     {
         memset(blk, 0, sizeof(blk));
         memset(page, 0, sizeof(page));
@@ -223,6 +228,7 @@ void CodeImageAdd(uint32_t base, const void* data, uint32_t len)
     const bool warn = (!taken && !s.warnedFull);
     if (warn) s.warnedFull = true;
 
+    InterlockedIncrement(&s.gen);       // 字节变了 ⇒ 指令解码缓存作废
     LeaveCriticalSection(&s.cs);
 
     // 日志放在锁外：ORB_LOG_* 会写文件，不该在临界区里做。
@@ -315,8 +321,15 @@ void CodeImageClear()
     s.warnDisabled = false;
     memset(s.page, 0, sizeof(s.page));
     memset(&s.st, 0, sizeof(s.st));
+    InterlockedIncrement(&s.gen);       // 镜像清空 ⇒ 指令解码缓存作废
 
     LeaveCriticalSection(&s.cs);
+}
+
+unsigned CodeImageGeneration()
+{
+    return static_cast<unsigned>(
+        InterlockedCompareExchange(&S().gen, 0, 0));
 }
 
 unsigned long long CodeImageBytes()

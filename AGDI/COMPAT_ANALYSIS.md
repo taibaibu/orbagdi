@@ -1,8 +1,15 @@
 <h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
 
-<h1 style="color:red">任何偏离 <code>AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+<h1 style="color:red">任何偏离 <code>.../DbgCM</code> 实现方法的实现皆为风险。</h1>
 
 <h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+> **`DbgCM` 去向（2026-10-19）**：Keil 参考驱动源码已**移出本工程**，现在 `.../DbgCM`
+> —— 即 `AGDI\` 的同级目录（相对本文件 `..\DbgCM`；另有一份更早的同内容副本落在
+> `ORBAGDI\AGDI\DbgCM`，59 个文件 / 49,537 行，两份一致）。
+> 全文所有 `DbgCM/AGDI.CPP:17756` 形式的引用都是**相对该树根**的写法，**照旧有效**，
+> 只是前缀不再是 `AGDI\`；查证时从新位置打开同名文件即可。
+> 构建对本树**零依赖**（`build.ps1` 只递归 `src\`）：移走后 37 个 TU 全编、DLL 字节数不变。
 
 ---
 # COMPAT_ANALYSIS — ORB_AGDI 对 Keil `CMSIS_AGDI.dll` 的逆向与 ABI 对照
@@ -709,7 +716,7 @@ DPIDR）。`Dap::Connect()` 一路走到 `DAP_ReadReg`，靠"宿主自己会连�
 用来做**全部内存访问**的那个 AHB-AP。
 
 **根因**：`ApClassName()` 用 `(idr >> 13) & 7` —— 只有 **3 位**。而 Keil 自己的
-`DbgCM/Debug.h`（本工程保留的参考实现）定义：
+`DbgCM/Debug.h`（Keil 参考实现，现位于 `.../DbgCM`，见文首"去向"）定义：
 
 ```c
 #define APIDR_CLASS      0x0001E000 // AP Class Mask —— 位 [16:13]，共 4 位
@@ -7297,7 +7304,7 @@ test\etm_debug.ps1 -Cap D:\cap.orb # 用已有捕获，完全不碰硬件
   `TRACE_CLK` 在 **VA `0x1008C4D0`**。`pio+0x214` = 建/取 VTR、`+0x218` = `p_putval`、`+0x238` = 注册回调。
   两者取值都来自全局 `0x12bc775c`，**单位 Hz**（证据：`0x1008C300` 把它拿去 `div` 分频器试值）。
 
-**`DbgCM`（仓库内官方参考源码）侧**：
+**`DbgCM`（官方参考源码，现位于 `.../DbgCM`，见文首"去向"）侧**：
 
 - `UpdateCycles()`（`DbgCM/AGDI.CPP:3565`）：读 **`DWT_CYCCNT`** → `RegARM.nCycles += val - RegDWT.CYCCNT`
   （32 位回绕安全）→ `pio->cycles = RegARM.nCycles`。调用点：运行循环开了 trace 就每轮调

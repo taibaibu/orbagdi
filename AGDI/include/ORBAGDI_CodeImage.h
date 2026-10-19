@@ -30,6 +30,10 @@ void CodeImageClear();
 /// 当前留存的镜像字节数（日志用）。
 unsigned long long CodeImageBytes();
 
+/// 镜像内容版本号：Add / Clear 时递增。用于让按地址缓存"指令形状"的调用方作废缓存
+/// （见 ORBAGDI_InstrScan.h 的 ScanToCached）。
+unsigned CodeImageGeneration();
+
 // ---- 来源 ②：兜底读目标内存 ----
 
 /// 注册兜底读；fn 传 nullptr 表示取消。

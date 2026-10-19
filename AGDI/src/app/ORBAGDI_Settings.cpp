@@ -130,22 +130,19 @@ enum : WORD {
     kIdBtnPdscLog,
     kIdGrpPdsc,
 
-    // Record page.  记录缓冲（P1-1 块链）与落盘（P2-1 / P2-2）。
-    kIdGrpRecBuf   = 1701,   // ★ 锚点
+    // Trace Cache page. 内存缓冲（P1-1 块链）+ 记录 cache 的总开关。
+    // `trfile=`（OFLOW 文件）仍然只做选项串，界面上不提供入口。
+    kIdGrpTrCache  = 1701,   // ★ 锚点
     kIdEditTrChunk,          // trchunk= 每块 MB
     kIdEditTrMem,            // trmem=   内存上限 MB
-    kIdGrpRecLog,
-    kIdEditTrFile,           // trfile=  OFLOW 落盘路径
-    kIdBtnTrFile,
-    kIdEditTrRec,            // trrec=   记录日志路径
-    kIdBtnTrRec,
-    kIdEditTrKeep,           // trkeep=  同目录保留几个
-    kIdValRecInfo,           // 生效值回显
+    kIdEditTrCap,            // trrecmb= 文件 cache 上限 MB（0 = 不限，**默认 0**）
+    kIdValCacheInfo,         // 生效值回显
+    kIdChkTrRecFile,         // trrec=1  记录 cache 到文件（日志目录自动命名）
 
     // Info page.
     kIdEditInfo    = 1500,   // ★ 锚点。the scrollable text box
 
-    // Power 页，1801 是该页锚点（1501/1601/1701 已被 Info 文本框、底部按钮、Record 占掉）。
+    // Power 页，1801 是该页锚点（1501/1601/1701 已被 Info 文本框、底部按钮、Trace Cache 占掉）。
     // ⚠ 这一页**没有配置键**：不进选项串、不落工程，所以不在 Field 表里，Accept() 也不读它。
     kIdGrpPwrVtref = 1801,   // ★ 锚点。"Vtref" 组框
     kIdCmbPwrVtref,          // 档位下拉（固定档）
@@ -172,14 +169,14 @@ enum {
     kPageTrace  = 1,
     kPageFlash  = 2,
     kPagePack   = 3,
-    kPageRecord = 4,
+    kPageTraceCache = 4,
     kPagePower  = 5,
     kPageInfo   = 6,
     kPageCount  = 7
 };
 
 const wchar_t* const kPageNames[kPageCount] = {
-    L"Debug", L"Trace", L"Flash", L"Pack", L"Record", L"Power", L"Info"
+    L"Debug", L"Trace", L"Flash", L"Pack", L"Trace Cache", L"Power", L"Info"
 };
 
 // Standard control class atoms.  A tab control has no atom - it is created from
@@ -1534,41 +1531,37 @@ void AddPackItems(DlgTpl& t) {
 }
 
 // ===========================================================================
-// Page 4 - "Record"：记录缓冲（块链）与落盘。这 5 个键原来只能手改选项串，而实机验收
-// 必须手填（trchunk=1 trmem=2 trrec=1 trfile=1 trkeep=2）—— 默认 1 GB 上限到不了。
+// Page 4 - "Trace Cache"：内存缓冲（块链）+ 记录 cache 的总开关。
+// `trrec=`（记录 cache 的 .trc）给了复选框；`trfile=`（OFLOW 的 .orb）仍只做选项串 ——
+// 它给外部工具用，本驱动的查询回放走 trrec=，界面不重复提供入口。
 // ⚠ 本页文字必须与 kMemLimitMax（ORBAGDI_TraceWin.cpp）一致：两边一起改，否则界面写一个
 // 数、实际另一个，属于最难查的偏差。
-// ⚠ trrecmb=（落盘文件上限，默认 2 GB）还没上这一页，只能手改选项串。
 // ===========================================================================
-void AddRecordItems(DlgTpl& t) {
-    Grp(t, kIdGrpRecBuf, L"Record Buffer", 6, 4, 386, 58);
+void AddTraceCacheItems(DlgTpl& t) {
+    Grp(t, kIdGrpTrCache, L"Trace cache", 6, 4, 386, 90);
     {
         Lay L(t, 12, 15, 374);
         L.AddKey(L"Block size:").AddEdit(kIdEditTrChunk, 40).AddLabel(L"MB", 24);
         L.Gap(24);
         L.AddKey(L"Memory cap:", 66).AddEdit(kIdEditTrMem, 40).AddLabel(L"MB", 24);
         L.Row();
-        L.AddLabel(L"0 = default: 4 MB per block, cap = physical RAM / 4 (at most 1 GB).", 374);
+        // 文件 cache 的上限（trrecmb=）。和内存上限是两回事：内存决定"能回看多远"，
+        // 文件决定"磁盘上留多长"。默认 0 = 不限（到顶会让时间轴中段出现空洞）。
+        L.AddKey(L"File cap:", 52).AddEdit(kIdEditTrCap, 46).AddLabel(L"MB", 24);
+        L.Gap(12);
+        // 与 Trace 页的 "Unlimited Trace"（`trunlim`）联动：勾上就强制 0 并灰掉。
+        L.AddLabel(L"(0 = no limit; forced by \"Unlimited Trace\")", 250);
         L.Row();
-        L.AddLabel(L"Applied at the first Connect - changing them needs a new session.", 374);
+        // 勾上 = 选项串写 `trrec="1"`（日志目录下自动命名）；取消 = 清掉该键。
+        // 手填过路径（目录或文件名）的用户不会被这里改写，见 ReadTraceCache。
+        L.AddCheck(kIdChkTrRecFile, L"Cache records to file (trrec=1, log folder)", 374);
+        L.Row();
+        L.AddLabel(L"0 = default: 4 MB block, memory cap = physical RAM / 4 (at most 256 MB).", 374);
+        L.Row();
+        L.AddLabel(L"At the file cap the cache stops and a warning box appears.", 374);
     }
 
-    Grp(t, kIdGrpRecLog, L"Logging", 6, 66, 386, 88);
-    {
-        Lay L(t, 12, 77, 374);
-        L.AddKey(L"Trace file:").AddEdit(kIdEditTrFile, 258).AddButton(kIdBtnTrFile, L"...", 42);
-        L.Row();
-        L.AddKey(L"Record log:").AddEdit(kIdEditTrRec, 258).AddButton(kIdBtnTrRec, L"...", 42);
-        L.Row();
-        L.AddKey(L"Keep files:").AddEdit(kIdEditTrKeep, 40)
-                                .AddLabel(L"0 = never delete old files", 140);
-        L.Row();
-        L.AddLabel(L"Empty = off.  1 = the log directory.  <dir> = that directory.  <name>.orb = that name.", 374);
-        L.Row();
-        L.AddLabel(L"Files: ORB_trace_<time>.orb (OFLOW, for external tools) / ORB_rec_<time>.trc (compact records).", 374);
-    }
-
-    Val(t, kIdValRecInfo, 6, 160, 386, 24);
+    Val(t, kIdValCacheInfo, 6, 98, 386, 30);
 }
 
 // ===========================================================================
@@ -1627,7 +1620,7 @@ DlgTpl BuildPage(int page) {
     case kPageTrace:  AddTraceItems(items);  break;
     case kPageFlash:  AddFlashItems(items);  break;
     case kPagePack:   AddPackItems(items);   break;
-    case kPageRecord: AddRecordItems(items); break;
+    case kPageTraceCache: AddTraceCacheItems(items); break;
     case kPagePower:  AddPowerItems(items);  break;
     default:          AddInfoItems(items);   break;
     }
@@ -2036,59 +2029,82 @@ void FillPack(HWND p, const Config& c) {
     FieldFill(p, c, kPackFields, kPackFieldCount);
 }
 
-/// Restates what the Record page will actually do.  "0" is a *default*, not
+/// Restates what the Trace Cache page will actually do.  "0" is a *default*, not
 /// "off", and the derived block count is the number that says whether the
 /// block chain (P1-1) will ever switch blocks - so it is worth spelling out.
-void RecInfo(HWND p) {
+void CacheInfo(HWND p) {
     const int chunk = GetDec(p, kIdEditTrChunk, 0);
     const int mem   = GetDec(p, kIdEditTrMem, 0);
-    const int keep  = GetDec(p, kIdEditTrKeep, 3);
-
-    wchar_t wf[kPathMax] = L"";
-    wchar_t wr[kPathMax] = L"";
-    GetDlgItemTextW(p, kIdEditTrFile, wf, kPathMax);
-    GetDlgItemTextW(p, kIdEditTrRec, wr, kPathMax);
 
     const int chunkMb = (chunk > 0) ? chunk : 4;
 
-    wchar_t text[640];
+    wchar_t head[260];
     if (mem > 0) {
-        _snwprintf_s(text, _TRUNCATE,
-                     L"Effective: %d MB per block, cap %d MB -> %d block(s)\r\n"
-                     L"Trace file : %s\r\n"
-                     L"Record log : %s      keep %d file(s)",
-                     chunkMb, mem, (chunkMb > 0) ? (mem / chunkMb) : 0,
-                     wf[0] ? wf : L"(off)", wr[0] ? wr : L"(off)", keep);
+        _snwprintf_s(head, _TRUNCATE,
+                     L"Effective: %d MB per block, cap %d MB -> %d block(s)",
+                     chunkMb, mem, (chunkMb > 0) ? (mem / chunkMb) : 0);
     } else {
-        _snwprintf_s(text, _TRUNCATE,
+        _snwprintf_s(head, _TRUNCATE,
                      L"Effective: %d MB per block, cap = physical RAM / 4 "
-                     L"(at most 1 GB)\r\n"
-                     L"Trace file : %s\r\n"
-                     L"Record log : %s      keep %d file(s)",
-                     chunkMb, wf[0] ? wf : L"(off)", wr[0] ? wr : L"(off)", keep);
+                     L"(at most 256 MB)", chunkMb);
     }
-    SetDlgItemTextW(p, kIdValRecInfo, text);
+
+    // 文件 cache 与内存上限无关（`trmem=0` 是"按默认"，不是"关"），所以开关与
+    // 它自己的上限单独报一句 —— 否则用户没法从这一行看出 trrec= 到底开没开。
+    const int capMb = GetDec(p, kIdEditTrCap, 0);
+    wchar_t capText[32];
+    if (capMb > 0) {
+        _snwprintf_s(capText, _TRUNCATE, L"%d MB", capMb);
+    } else {
+        lstrcpynW(capText, L"no limit", 32);
+    }
+
+    wchar_t text[400];
+    _snwprintf_s(text, _TRUNCATE, L"%s; file: %s, cap %s", head,
+                 IsCheck(p, kIdChkTrRecFile) ? L"on" : L"off", capText);
+    SetDlgItemTextW(p, kIdValCacheInfo, text);
 }
 
-// Record 页的字段表：3 个普通数值。两条路径带 `...` 按钮，单独处理（见下面）。
-const Field kRecFields[] = {
+// Trace Cache 页的字段表：3 个普通数值（块大小、内存上限、文件上限）。`trfile=` 不在表里
+// （界面没入口）；`trrec=` 走复选框，是字符串键，也不进这张表 —— 见 Fill/ReadTraceCache。
+const Field kCacheFields[] = {
     // 上下界**与驱动侧的夹取保持一致**（`kChunkMBMin/Max` = 1/64、`kMemMBMax` = 4096，
     // 见 ORBAGDI_TraceWin.cpp）。原来这里是 4096 / 65536 —— 用户填 4096 会被驱动
     // 悄悄钳到 64，界面却显示填进去了。
     { kIdEditTrChunk, FKind::Dec, offsetof(Config, trChunkMB), 0, 0, 64,
-      L"Record block size must be 0 (default) or 1..64 MB." },
+      L"Trace cache block size must be 0 (default) or 1..64 MB." },
     { kIdEditTrMem,   FKind::Dec, offsetof(Config, trMemMB),   0, 0, 4096,
-      L"Record memory cap must be 0 (default) or 1..4096 MB." },
-    { kIdEditTrKeep,  FKind::Dec, offsetof(Config, trKeep),    0, 0, 999,
-      L"\"Keep files\" must be 0 (never delete) or 1..999." },
+      L"Trace cache memory cap must be 0 (default) or 1..4096 MB." },
+    // 文件上限没有驱动侧的夹取（0 原样当"不限"，也是**默认值**），这里给个 1 TB 的
+    // 界面边界，免得 2^31 那样的数写进选项串后乘 1 MB 溢出。
+    { kIdEditTrCap,   FKind::Dec, offsetof(Config, trRecMB),   0, 0, 1048576,
+      L"Cache file cap must be 0 (no limit, default) or 1..1048576 MB." },
 };
-const int kRecFieldCount = sizeof(kRecFields) / sizeof(kRecFields[0]);
+const int kCacheFieldCount = sizeof(kCacheFields) / sizeof(kCacheFields[0]);
 
-void FillRecord(HWND p, const Config& c) {
-    FieldFill(p, c, kRecFields, kRecFieldCount);
-    SetDlgItemTextW(p, kIdEditTrFile, Widen(c.trFile).c_str());
-    SetDlgItemTextW(p, kIdEditTrRec, Widen(c.trRec).c_str());
-    RecInfo(p);
+/// File cap 与 Trace 页的 "Unlimited Trace"（`trunlim`）联动：勾上 ⇒ 文件上限**强制**
+/// "不限"，框灰掉并显示 0。
+/// ⚠ 框里的数必须就是真正生效的数：灰着还留着 8192，就是本文件顶部警告的那类偏差
+/// （"界面写一个数、实际另一个"）。所以勾上时改写文本，而不是只 `EnableWindow(FALSE)`。
+void UpdateTrCapEnable(HWND cachePage, bool unlim) {
+    if (!cachePage) return;
+    if (unlim) SetDlgItemTextW(cachePage, kIdEditTrCap, L"0");
+    EnableWindow(GetDlgItem(cachePage, kIdEditTrCap), unlim ? FALSE : TRUE);
+    CacheInfo(cachePage);
+}
+
+/// 回显内存两项 + 文件 cache 开关。`trFile`（OFLOW）仍然不读也不写 —— 界面上没有它，
+/// 就不能在按 OK 时把工程里已有的值悄悄清成空串。
+void FillTraceCache(HWND p, const Config& c) {
+    FieldFill(p, c, kCacheFields, kCacheFieldCount);
+
+    // `trRec` 是字符串键（"1" / 目录 / 文件名 / 空），复选框只表达"开/关"：
+    // 非空即开 —— 手填的路径在这里显示成勾选，但不会被改写（见 ReadTraceCache）。
+    SetCheck(p, kIdChkTrRecFile, c.trRec[0] != '\0');
+
+    // `unlimitedTrace` 在 Trace 页，这里只有 Config 的值可用；两页都建完之后
+    // 由 SheetProc 的 `kIdChkUnlim` 命令继续同步（用户当场勾/取消时）。
+    UpdateTrCapEnable(p, c.unlimitedTrace);
 }
 
 // ===========================================================================
@@ -2303,8 +2319,25 @@ bool ReadPack(SheetCtx* ctx, HWND p, Config& c) {
     return FieldRead(ctx, p, c, kPackFields, kPackFieldCount);
 }
 
-bool ReadRecord(SheetCtx* ctx, HWND p, Config& c) {
-    if (!FieldRead(ctx, p, c, kRecFields, kRecFieldCount)) return false;
+/// 读内存两项 + 文件 cache 开关。`trFile`（OFLOW）保持原值不动 —— 界面上没有它，
+/// 就不该因为这里没这一行把工程里的选项串抹掉。
+bool ReadTraceCache(SheetCtx* ctx, HWND p, Config& c) {
+    if (!FieldRead(ctx, p, c, kCacheFields, kCacheFieldCount)) return false;
+
+    // "Unlimited Trace"（Trace 页）勾着时文件上限**强制** 0：框已经灰掉并显示 0，
+    // 这里再钉一次 —— 灰显是第一道闸，脚本/键盘仍能绕过它把值改回去。
+    if (IsCheck(ctx->hPage[kPageTrace], kIdChkUnlim)) c.trRecMB = 0;
+
+    // 复选框只决定"开/关"，**不覆盖手填的路径**：
+    //   勾上 + 原值为空 → `trrec="1"`（%TEMP% 下自动命名）
+    //   勾上 + 原有值   → 原样保留（目录或文件名，用户手填过）
+    //   取消            → 清空，等于 `trrec=` 没开
+    if (!IsCheck(p, kIdChkTrRecFile)) {
+        c.trRec[0] = '\0';
+    } else if (c.trRec[0] == '\0') {
+        c.trRec[0] = '1';
+        c.trRec[1] = '\0';
+    }
 
     // 上限 < 一块：不是错误（`TraceWinSetBuffer` 会把它钳成单块），但代价是整段
     // 历史都没了，所以要说一声。
@@ -2313,13 +2346,6 @@ bool ReadRecord(SheetCtx* ctx, HWND p, Config& c) {
                     L"buffer is clamped to a single block and no earlier history "
                     L"is kept.", c.trMemMB, c.trChunkMB);
     }
-
-    wchar_t wf[kPathMax] = L"";
-    GetDlgItemTextW(p, kIdEditTrFile, wf, kPathMax);
-    Narrow(wf, c.trFile, sizeof(c.trFile));
-    wchar_t wr[kPathMax] = L"";
-    GetDlgItemTextW(p, kIdEditTrRec, wr, kPathMax);
-    Narrow(wr, c.trRec, sizeof(c.trRec));
     return true;
 }
 
@@ -2390,46 +2416,6 @@ void PdscLogBrowse(HWND p) {
     ofn.lpstrTitle  = L"Where to log the debug-description sequences";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
     if (GetSaveFileNameW(&ofn)) SetDlgItemTextW(p, kIdEditPdscLog, path);
-}
-
-/// Where the raw trace stream is dumped (`trfile=`, P2-1, OFLOW format).
-void TrFileBrowse(HWND p) {
-    wchar_t path[kPathMax] = L"";
-    GetDlgItemTextW(p, kIdEditTrFile, path, kPathMax);
-
-    OPENFILENAMEW ofn;
-    memset(&ofn, 0, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = p;
-    ofn.lpstrFilter = L"Trace stream (*.orb)\0*.orb\0All files (*.*)\0*.*\0";
-    ofn.lpstrFile   = path;
-    ofn.nMaxFile    = kPathMax;
-    ofn.lpstrTitle  = L"Where to dump the raw trace stream (trfile=)";
-    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (GetSaveFileNameW(&ofn)) {
-        SetDlgItemTextW(p, kIdEditTrFile, path);
-        RecInfo(p);
-    }
-}
-
-/// Where the compact record log goes (`trrec=`, P2-2).
-void TrRecBrowse(HWND p) {
-    wchar_t path[kPathMax] = L"";
-    GetDlgItemTextW(p, kIdEditTrRec, path, kPathMax);
-
-    OPENFILENAMEW ofn;
-    memset(&ofn, 0, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = p;
-    ofn.lpstrFilter = L"Record log (*.trc)\0*.trc\0All files (*.*)\0*.*\0";
-    ofn.lpstrFile   = path;
-    ofn.nMaxFile    = kPathMax;
-    ofn.lpstrTitle  = L"Where to keep the record log (trrec=)";
-    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (GetSaveFileNameW(&ofn)) {
-        SetDlgItemTextW(p, kIdEditTrRec, path);
-        RecInfo(p);
-    }
 }
 
 /// Power 页的 Apply —— **整个设置页里只有这里**会把电压/使能发给探针（OK/Cancel 不走这条路）。
@@ -2509,7 +2495,7 @@ bool Accept(SheetCtx* ctx) {
     if (!ReadTrace(ctx, ctx->hPage[kPageTrace], c)) return false;
     if (!ReadFlash(ctx, ctx->hPage[kPageFlash], c)) return false;
     if (!ReadPack (ctx, ctx->hPage[kPagePack], c)) return false;
-    if (!ReadRecord(ctx, ctx->hPage[kPageRecord], c)) return false;
+    if (!ReadTraceCache(ctx, ctx->hPage[kPageTraceCache], c)) return false;
 
     // Trace Enable 一关就**当场**收源，不能等下一次 Connect：ReadTrace() 只写全局配置，而运行中
     // 的状态机不读配置 —— OrbTrace/ITM 还在跑、TraceDrainWanted() 仍为真，worker 继续每 2 ms
@@ -2666,7 +2652,7 @@ INT_PTR CALLBACK SheetProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
         FillTrace(ctx->hPage[kPageTrace], c);
         FillFlash(ctx->hPage[kPageFlash], c);
         FillPack(ctx->hPage[kPagePack], c);
-        FillRecord(ctx->hPage[kPageRecord], c);
+        FillTraceCache(ctx->hPage[kPageTraceCache], c);
 
         // Power 页：能力探测**只做一次**（它要枚举 USB），建页前拿到，
         // `FillPower` 与后面几个命令处理器共用 —— 否则点一下复选框就枚举一次 USB。
@@ -2747,6 +2733,17 @@ INT_PTR CALLBACK SheetProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
                               IsCheck(ctx->hPage[kPageTrace], kIdChkTrcEn));
             return TRUE;
 
+        // "Unlimited Trace" 勾上 ⇒ Trace Cache 页的 File cap 变"无限"（灰掉 + 显示 0）。
+        // 两个页不同页，看不出联动会以为"勾了没生效"，所以当场就刷。
+        case kIdChkUnlim:
+            UpdateTrCapEnable(ctx->hPage[kPageTraceCache],
+                              IsCheck(ctx->hPage[kPageTrace], kIdChkUnlim) != FALSE);
+            if (IsCheck(ctx->hPage[kPageTrace], kIdChkUnlim)) {
+                Report(ctx, "Trace: \"Unlimited Trace\" (trunlim) is ON - the cache file "
+                            "cap on the Trace Cache page is forced to no limit.");
+            }
+            return TRUE;
+
         // `tswin`（"Show the time column"）**单独提示**，不跟别的复选框一起沉默：
         // `bHideTimestamps` 同时是 uVision 取数门的一环（COMPAT_ANALYSIS.md
         // §10.20.1），打开可能让 Trace Data 窗口**一行都不取**。勾上时把这句话写到
@@ -2777,9 +2774,6 @@ INT_PTR CALLBACK SheetProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
         case kIdBtnFlmBrw:   FlmBrowse(ctx->hPage[kPageFlash]);           return TRUE;
         case kIdBtnFlmAuto:  FlmDetect(ctx, ctx->hPage[kPageFlash]);      return TRUE;
         case kIdBtnPdscLog:  PdscLogBrowse(ctx->hPage[kPagePack]);        return TRUE;
-
-        case kIdBtnTrFile:   TrFileBrowse(ctx->hPage[kPageRecord]);       return TRUE;
-        case kIdBtnTrRec:    TrRecBrowse (ctx->hPage[kPageRecord]);       return TRUE;
 
         // Power 页。**只有 Apply 会碰探针的电源**（见 PowerApply 的说明）。
         // 两个使能框只刷新状态回显（"Apply 会发什么"），一个字节都不发。

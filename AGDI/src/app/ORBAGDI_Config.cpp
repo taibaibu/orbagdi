@@ -89,20 +89,23 @@ const ExtraKey kExtraKeys[] = {
     // ORBAGDI_Config.h 里 tsWin 的说明与 COMPAT_ANALYSIS.md §10.20.1。
     { "tswin",     KeyType::Bool, offsetof(Config, tsWin),             0 },
     // 记录缓冲的规模（块链，P1-1）。0 = 默认（4 MB/块；上限物理内存 1/4 封顶
-    // 1 GB）。默认上限下"到上限摘块"要攒够 1 GB 才走得到，测试用这两条把它缩短。
+    // 256 MB）。默认上限下"到上限摘块"要攒够 256 MB 才走得到，测试用这两条把它缩短。
     // ⚠ 必须是 Int（十进制）：Uint 键是按十六进制读的（见 SetExtra）。
     { "trchunk",   KeyType::Int,  offsetof(Config, trChunkMB),         0 },
     { "trmem",     KeyType::Int,  offsetof(Config, trMemMB),           0 },
     // trmax：常驻记录条数上限，0 = 不限（默认）。⚠ 默认必须不限：内部曾硬编码 1,048,576 条，
     // ETM 下等于只能回看 0.13 s —— 一次 10 s 采集写进 82,658,740 条、静默裁掉 81,608,143 条，
-    // 而内存只用了 552 MB / 上限 1024 MB。控窗口大小用 trmem=（字节，精确）。
+    // 而内存只用了 552 MB（当时的默认上限是 1024 MB）。控窗口大小用 trmem=（字节，精确）。
     { "trmax",     KeyType::Int,  offsetof(Config, trMaxRecs),         0 },
-    // trace 落盘（P2-1）：trfile= 是**字符串**键（在 Parse/Format 里单独处理，
-    // 与 rddi=/flm= 同一种做法），trkeep 是普通整数键。
-    { "trkeep",    KeyType::Int,  offsetof(Config, trKeep),            3 },
-    // trrecmb: 落盘文件大小上限（MB），0 = 不限。默认 2 GB。
+    // trace 缓存文件（P2-1）：trfile= 是**字符串**键（在 Parse/Format 里单独处理，
+    // 与 rddi=/flm= 同一种做法）。没有“保留几个”的键：新采集段开始就删掉上一段的。
+    // trrecmb: cache 文件大小上限（MB），0 = 不限，**默认 0 = 不限**。
+    // 默认必须大于"全程数据量"：2 GB 在 ETM 下只够 ~2 分钟，到顶后文件冻结在**最早**
+    // 那一段、内存窗口继续 FIFO 滚动 ⇒ 时间轴中段留下一个既不在文件也不在内存的空洞
+    // （2026-10-19 实测丢 193 块 / 771 MB，那段拖过去只剩 BOUNDS）。文件在 disconnect /
+    // reset 时会被删掉，所以"不限"不会长期占盘。
     // ⚠ 必须是 Int（十进制）：Uint 键按十六进制读（见 SetExtra），写 2048 会变成 0x2048。
-    { "trrecmb",   KeyType::Int,  offsetof(Config, trRecMB),           2048 },
+    { "trrecmb",   KeyType::Int,  offsetof(Config, trRecMB),           0 },
     { "pcpresc",   KeyType::Int,  offsetof(Config, pcPrescaler),       0 },
     // pcperiod："Periodic"（PC 采样周期使能），默认 1（开）。
     // ⚠ 曾默认 0：ProgramItmDwt() 会无条件清 DWT_CTRL 的 bit0/bit9/bit12，pcperiod=0 就不置回来

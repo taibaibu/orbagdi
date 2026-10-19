@@ -12,7 +12,7 @@
 #include "pch.h"
 #include "ORBAGDI_Etb.h"
 #include "ORBAGDI_Itm.h"
-#include "ORBAGDI_Oflow.h"       // kOflowTagItm（落盘编码要用）
+#include "ORBAGDI_Oflow.h"       // kOflowTagItm（cache 编码要用）
 #include "ORBAGDI_Pdsc.h"
 #include "ORBAGDI_TraceFile.h"
 #include "ORBAGDI_TraceWin.h"
@@ -1144,7 +1144,7 @@ unsigned ItmPump(orb::Dap& dap, unsigned timeMs)
 
         total += (unsigned)n;
 
-        // 落盘（P2-1）：SWO 这条拿到的是**裸 ITM 字节**（不是 OFLOW 帧），所以由本层
+        // cache（P2-1）：SWO 这条拿到的是**裸 ITM 字节**（不是 OFLOW 帧），所以由本层
         // 编码成 OFLOW 帧再写 —— tag 1 = ITM（orbuculum `Inc/nw.h:26`）。
         TraceFileWriteStream(kOflowTagItm, buf, (unsigned)n);
 

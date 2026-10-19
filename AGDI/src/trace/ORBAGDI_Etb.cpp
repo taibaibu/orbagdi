@@ -15,7 +15,7 @@
 #include "ORBAGDI_Dap.h"
 #include "ORBAGDI_CoreSight.h"
 #include "ORBAGDI_TraceBehavior.h"
-#include "ORBAGDI_Oflow.h"       // kOflowTagItm / kOflowTagEtm（落盘编码要用）
+#include "ORBAGDI_Oflow.h"       // kOflowTagItm / kOflowTagEtm（cache 编码要用）
 #include "ORBAGDI_Rddi.h"
 #include "ORBAGDI_TraceFile.h"
 #include "ORBAGDI_TraceWin.h"
@@ -632,7 +632,7 @@ int EtbProcess(orb::Dap& dap)
                         ItmScratch(), itmLen, (int)kBufSize,
                         EtmScratch(), etmLen, (int)kBufSize);
         if (itmLen > 0) {
-            // 落盘（P2-1）：ETB 读回来的是裸字节，本层按 tag 编码成 OFLOW 帧再写。
+            // cache（P2-1）：ETB 读回来的是裸字节，本层按 tag 编码成 OFLOW 帧再写。
             // 格式化器已经把 ITM / ETM 分开，正好对应 OFLOW 的两个 tag。
             TraceFileWriteStream(kOflowTagItm, ItmScratch(), (unsigned)itmLen);
             ItmFeedBytes(ItmScratch(), itmLen);

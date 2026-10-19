@@ -52,7 +52,7 @@ struct State {
     // （= 官方的 "Data Overflow"）。
     unsigned long long lastDropped;
 
-    // 落盘的累计 QPC 计数。存**原始计数**、只在 OrbTraceGetStats() 里换算一次：
+    // cache 的累计 QPC 计数。存**原始计数**、只在 OrbTraceGetStats() 里换算一次：
     // 单次 fwrite 常常远不到 1 ms，每块都换算成毫秒会因取整把误差累加成假数。
     unsigned long long writeTicks;
 
@@ -61,14 +61,27 @@ struct State {
     unsigned long long tagBytes[256];
     unsigned           tagFrames[256];
 
+    // ---- 解码器状态的互斥 ---------------------------------------------------
+    // 抽 / 解拆成两个线程之后，解码器（deframer + ETM 引擎 + P1-0 补全）仍有第二个
+    // 入口：停机收尾时调试线程会走 OrbTracePump()。原来两边"恰好"靠挂起握手错开，
+    // 但那只是时序假设；这里显式加锁，粒度为"一块字节"，开销可忽略。
+    CRITICAL_SECTION decodeCs;
+
+    // 非解码线程请求"下一次解码前强制 ETM 重同步"。ETM 是相对地址，字节流一旦断开
+    // （RDDI 环溢出 / 本层丢块），此后解出的地址全是假的 —— 所以这个请求必须由
+    // 解码线程在持 decodeCs 时执行，不能由请求方直接改引擎状态。
+    volatile LONG resyncReq;
+
     // stats() 里漏一个成员就是未初始化值：停止路径在流从没打开过时也会打印这些计数（曾打出
     // 4.5e17 的 ITM 条数），只有 OrbTraceStart() 走过才会被清零。
     State() : active(false), oflow(true), handle(0), stats(), logged(false),
               sawData(false), reads(0), noData(0), errors(0), framesLogged(0),
-              lastBadSum(0), lastCobsErrors(0), lastDropped(0), writeTicks(0)
+              lastBadSum(0), lastCobsErrors(0), lastDropped(0), writeTicks(0),
+              resyncReq(0)
     {
         memset(tagBytes,  0, sizeof(tagBytes));
         memset(tagFrames, 0, sizeof(tagFrames));
+        InitializeCriticalSection(&decodeCs);
     }
 };
 
@@ -79,7 +92,7 @@ State& S()
     return *s;
 }
 
-// 落盘计时用的时钟。只累计原始计数，见 `State::writeTicks` 的说明。
+// cache 计时用的时钟。只累计原始计数，见 `State::writeTicks` 的说明。
 unsigned long long QpcTicks()
 {
     LARGE_INTEGER t;
@@ -153,7 +166,7 @@ void OnRawBytes(const uint8_t* data, int len)
     ItmFeedBytes(data, len);
 }
 
-// 解释一块原始字节：落盘 → 解帧 → 解码 → 错误折叠。
+// 解释一块原始字节：cache → 解帧 → 解码 → 错误折叠。
 // 完全不碰探针（代码镜像兜底读默认关闭），所以可以、也必须放在探针锁之外 —— 见头文件"抽/解 分离"。
 // 调用者保证：同一块只喂一次、顺序与 OrbTracePullRaw 一致。
 void ProcessBytes(const uint8_t* data, unsigned n)
@@ -161,7 +174,17 @@ void ProcessBytes(const uint8_t* data, unsigned n)
     State& s = S();
     if (!data || !n) return;
 
-    // 落盘（P2-1）：orbtrace 交出来的就是 OFLOW 帧（tag + payload + sum，COBS 编码），原样写入
+    // 解码器状态（deframer / ETM 引擎 / P1-0 补全）归持有这把锁的线程所有。
+    // 粒度是"一块字节"，相对 64 KB 的 memcpy 与解码成本可忽略。
+    EnterCriticalSection(&s.decodeCs);
+
+    // 别的线程请求的重同步（抽数线程发现 RDDI 环溢出、或本层队列丢块）在这里执行 ——
+    // 此刻引擎状态才归本线程所有，直接改会和正在跑的 ProcessBytes 撞。
+    if (InterlockedExchange(&s.resyncReq, 0) != 0) {
+        EtmTraceForceSync(false);
+    }
+
+    // cache（P2-1）：orbtrace 交出来的就是 OFLOW 帧（tag + payload + sum，COBS 编码），原样写入
     // 即可（orbuculum 的 -o 就这么做）。写在解帧之前，保证"文件里的字节 = 探针发的字节"。
     const unsigned long long w0 = QpcTicks();
     TraceFileWriteRaw(data, n);
@@ -174,24 +197,42 @@ void ProcessBytes(const uint8_t* data, unsigned n)
     }
 
     if (s.oflow) {
-        s.deframer.Pump(data, (int)n, &OnFrame, nullptr);
+            // ⚠ 切片推进，不能一次 Pump 整块（实测一块 64 KB）。
+            // 解帧错误（COBS 错 / 校验和错）说明"这个位置起字节不可信"，而 ETM 的地址是
+            // **相对**编码：错误点之后的字节若继续当连续流解，会解出一串假地址 ——
+            // 日志里的 `ETM: 解出的地址 0x01033080 不在任何常见映射区` 就是它们。
+            // 错误检测原先在整块**解完之后**：最多晚 64 KB 才发现，那一整段假地址已经
+            // 进了 Trace 窗口和覆盖率段（还会替 0x0103xxxx 这种地址白建 64 KB 段）。
+            // 切 512 B 后检测点前移到出错的那一小片：失步次数不变，假地址最多只来自
+            // 出错那一片，而不是整块。
+        const unsigned kSlice = 512;
+        unsigned off = 0;
+        while (off < n) {
+            const unsigned take = (n - off < kSlice) ? (n - off) : kSlice;
+            s.deframer.Pump(data + off, static_cast<int>(take), &OnFrame, nullptr);
+            off += take;
+
+            const unsigned long long bs = s.deframer.BadSum();
+            const unsigned long long ce = s.deframer.CobsErrors();
+            if (bs != s.lastBadSum || ce != s.lastCobsErrors) {
+                s.lastBadSum     = bs;
+                s.lastCobsErrors = ce;
+
+                    // 解帧层的错误（COBS 错 / 校验和错）→ 官方 "Data Stream Error"
+                    // （`DbgCM/Trace.h:149` T_ERR_DATA_ERR）。这两类错误原先只进日志，
+                    // 状态栏永远看不到 —— 上报链早已移植，缺的就是这个 producer。
+                orb::agdi::TraceWinErrorSet(orb::agdi::kTErrDataErr);
+
+                    // 丢了一帧 = ETM 字节流里有缺口：相对地址的基准断了，解码器接着算
+                    // 出来的全是假地址（P0-D）。ITM 不受影响 —— 帧边界就是它的包边界。
+                EtmTraceForceSync(false);
+            }
+        }
     } else {
         OnRawBytes(data, (int)n);
     }
 
-    // 解帧层的错误（COBS 错 / 校验和错）→ 官方 "Data Stream Error"
-    // （`DbgCM/Trace.h:149` T_ERR_DATA_ERR）。这两类错误原先只进日志，
-    // 状态栏永远看不到 —— 上报链早已移植，缺的就是这个 producer。
-    const OrbTraceStats st = OrbTraceGetStats();
-    if (st.badSum != s.lastBadSum || st.cobsErrors != s.lastCobsErrors) {
-        s.lastBadSum     = st.badSum;
-        s.lastCobsErrors = st.cobsErrors;
-        orb::agdi::TraceWinErrorSet(orb::agdi::kTErrDataErr);
-
-        // 丢了一帧 = ETM 字节流里有缺口：相对地址的基准断了，解码器接着算
-        // 出来的全是假地址（P0-D）。ITM 不受影响 —— 帧边界就是它的包边界。
-        EtmTraceForceSync(false);
-    }
+    LeaveCriticalSection(&s.decodeCs);
 }
 
 } // namespace
@@ -570,7 +611,9 @@ unsigned OrbTracePullRaw(orb::Dap& dap, uint8_t* out, unsigned cap, unsigned tim
             // P0-D：环回绕 ⇒ 任何关于同步状态的猜测都失效。ETM 的分支地址是
             // 相对的，缺口之后解出来的地址是假的；强制重新同步，等到下一个
             // A-SYNC/ISYNC 才恢复上报。这就是 orbuculum `orbmortem.c:1084` 那一段。
-            EtmTraceForceSync(false);
+            // ⚠ 本函数在抽数线程上：这里只**请求**，真正的 ForceSync 由解码线程在
+            // 下一块开始时执行（ProcessBytes 持解码锁时），见 OrbTraceRequestResync()。
+            InterlockedExchange(&s.resyncReq, 1);
         }
     }
     return total;
@@ -579,6 +622,11 @@ unsigned OrbTracePullRaw(orb::Dap& dap, uint8_t* out, unsigned cap, unsigned tim
 void OrbTraceDecodeRaw(const uint8_t* data, unsigned n)
 {
     ProcessBytes(data, n);
+}
+
+void OrbTraceRequestResync()
+{
+    InterlockedExchange(&S().resyncReq, 1);
 }
 
 unsigned OrbTracePump(orb::Dap& dap, unsigned timeMs)

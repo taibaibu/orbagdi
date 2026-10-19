@@ -43,5 +43,21 @@ struct ScanResult {
 ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
                   unsigned maxInstr, InstrEmitFn emit, void* emitCtx);
 
+/// 同 ScanTo，但按 pc 缓存“指令形状”（长度 / 分支分类 / 直接目标），命中时不再调用
+/// read、也不进 capstone。**只适用于 read 反映代码镜像内容、且镜像在两次扫描之间不变的
+/// 场景**（ETM 的 P1-0 补全就是）：缓存随 CodeImageGeneration() 变化整表作废。
+ScanResult ScanToCached(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
+                        unsigned maxInstr, InstrEmitFn emit, void* emitCtx);
+
+/// 缓存计数（诊断用）。
+struct InstrScanCacheStats {
+    unsigned long long hits;
+    unsigned long long misses;
+    unsigned long long flushes;   ///< 镜像变化导致整表作废的次数
+    unsigned           slots;     ///< 槽位数；0 = 缓存没建起来
+};
+
+void InstrScanGetCacheStats(InstrScanCacheStats& out);
+
 } // namespace agdi
 } // namespace orb

@@ -59,6 +59,10 @@ unsigned OrbTracePump(orb::Dap& dap, unsigned timeMs);
 unsigned OrbTracePullRaw(orb::Dap& dap, uint8_t* out, unsigned cap, unsigned timeMs);
 void     OrbTraceDecodeRaw(const uint8_t* data, unsigned n);
 
+// 请求"下一块解码前强制 ETM 重同步"。可在任意线程调（只置一个标志）——
+// ETM 的分支地址是相对的，字节流断开（RDDI 环溢出、本层丢块）之后解出的地址是假的。
+void     OrbTraceRequestResync();
+
 struct OrbTraceStats {
     unsigned long long bytes;       // 从端点读到的原始字节
     unsigned long long frames;      // 解出的 OFLOW 帧
@@ -71,7 +75,7 @@ struct OrbTraceStats {
     // RDDI 环溢出累计丢的字节：判断“抽数跟不上”的定量依据。
     unsigned long long dropped;
 
-    // 同步落盘（fwrite）耗时，单独列出来才能区分解码慢和写盘慢。
+    // 同步写 cache（fwrite）耗时，单独列出来才能区分解码慢和写盘慢。
     unsigned long long writeMs;
 };
 OrbTraceStats OrbTraceGetStats();

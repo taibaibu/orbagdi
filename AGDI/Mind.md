@@ -358,7 +358,8 @@ Get-ChildItem "$env:TEMP" -Filter 'ORB*.log' | Sort-Object LastWriteTime -Descen
 > **最省事的一条：拿日志原文搜源码。** 日志字符串几乎都唯一，一搜就得到 `文件:行`；
 > 反汇编只用来回答"崩的是哪一句、参数从哪来"。
 
-**然后必须对照官方参考实现**（`DbgCM/` 是 Keil 原版）：
+**然后必须对照官方参考实现**（`.../DbgCM` 是 Keil 原版，已移出本工程，
+见 `COMPAT_ANALYSIS.md` 文首"去向"；文中的 `DbgCM/xxx.cpp:行号` 都是相对该树根的写法）：
 
 * 同一个 `case`，官方怎么写、我们怎么写，**逐行比**；
 * 本例就是靠这一比出来的：官方 `hMfrm = (HWND)vp;`，

@@ -5,9 +5,18 @@
  * 手写 Thumb 解码维护不起：I1 = NOT(J1 EOR S) 取反位、LDR.W PC 误判成直接分支，错一位就是
  * 静默走错路。capstone 给长度 / 分支 id / 目标 / 条件码，接 RISC-V 只改 cs_open() 参数。
  * ⚠ 这里只管解码；FillGap() 只在抽数 worker 线程上调，InstrDecode() 是公开 API 仍加锁。
+ *
+ * ---- 为什么加"指令形状缓存"（ScanToCached）------------------------------------
+ * P1-0 补全每秒要解上百万条指令，而同一段代码在一次会话里会被反复扫（循环、反复调用）。
+ * 原来每条指令都要：read 回调（CodeImageRead 加锁 + 页查找 + memcpy）→ InstrDecode
+ * （第二次加锁 + capstone + detail）。实测 106 ms/64 KB，而数据源是 3 MB/s ⇒ RDDI 环
+ * 丢掉 82% 的数据。指令形状只取决于 pc 处的字节，字节来自代码镜像且会话内不变，所以
+ * 按 pc 缓存 {len, 分支形状, target} 就够了；镜像一变（CodeImageGeneration 递增）整表丢。
+ * 命中路径不再读字节、不再进 capstone。
  */
 #include "pch.h"
 #include "ORBAGDI_InstrScan.h"
+#include "ORBAGDI_CodeImage.h"   // CodeImageGeneration()：缓存作废的唯一依据
 
 #include <capstone/capstone.h>
 
@@ -155,6 +164,79 @@ bool Classify(const cs_insn& insn, InstrInfo& o)
     }
 }
 
+// ---------------------------------------------------------------------------
+// 指令形状缓存（只给 ScanToCached 用，见文件头）
+// ---------------------------------------------------------------------------
+// 槽位数 = 512 KB Flash / 2 B：Cortex-M 的最小指令是 2 B，所以"每个半字一个槽"能让
+// 512 KB 的镜像直接映射、零冲突。RAM 里跑的函数会与 Flash 地址撞槽，撞了只是回到慢路，
+// 不影响正确性（命中判定要看 pc 完全相等）。
+const unsigned kICacheSlots = 1u << 18;              // 262144
+const unsigned kICacheMask  = kICacheSlots - 1u;
+
+// 16 B/条（对齐后），262144 × 16 = 4 MB。故意不释放（同 capstone 句柄）。
+struct ICacheEntry {
+    uint32_t pc;        // 命中的 pc；len == 0 表示空槽
+    uint32_t target;
+    uint8_t  len;
+    uint8_t  flags;
+    uint16_t pad;
+};
+
+enum {
+    kFlagBranch = 1u << 0,
+    kFlagDirect = 1u << 1,
+    kFlagCond   = 1u << 2,
+    kFlagCall   = 1u << 3,
+};
+
+ICacheEntry*     g_icache    = nullptr;
+bool             g_icacheFailed = false;
+unsigned         g_icacheGen = 0;
+unsigned long long g_cacheHits   = 0;
+unsigned long long g_cacheMisses = 0;
+unsigned long long g_cacheFlushes = 0;
+
+ICacheEntry* ICache()
+{
+    if (g_icache) return g_icache;
+    if (g_icacheFailed) return nullptr;
+
+    // 首次用时才分配：不开 trace 的会话一个字节都不占。
+    ICacheEntry* p = static_cast<ICacheEntry*>(malloc(sizeof(ICacheEntry) * kICacheSlots));
+    if (!p) {
+        g_icacheFailed = true;
+        ORB_LOG_WARN("InstrScan: 指令缓存分配失败（%u 槽）—— 回退到逐条解码",
+                     kICacheSlots);
+        return nullptr;
+    }
+    memset(p, 0, sizeof(ICacheEntry) * kICacheSlots);
+    g_icache = p;
+    return p;
+}
+
+// 镜像版本变了就整表作废。memset 4 MB ≈ 0.3 ms，只在"下载/清空镜像之后第一次扫"发生。
+bool CacheReady()
+{
+    if (!ICache()) return false;
+    const unsigned g = CodeImageGeneration();
+    if (g != g_icacheGen) {
+        memset(g_icache, 0, sizeof(ICacheEntry) * kICacheSlots);
+        g_icacheGen = g;
+        ++g_cacheFlushes;
+    }
+    return true;
+}
+
+uint8_t FlagsOf(const InstrInfo& o)
+{
+    uint8_t f = 0;
+    if (o.branch) f |= kFlagBranch;
+    if (o.direct) f |= kFlagDirect;
+    if (o.cond)   f |= kFlagCond;
+    if (o.call)   f |= kFlagCall;
+    return f;
+}
+
 } // namespace
 
 bool InstrDecode(uint32_t pc, const uint8_t* p, unsigned avail, InstrInfo& o)
@@ -188,8 +270,10 @@ bool InstrDecode(uint32_t pc, const uint8_t* p, unsigned avail, InstrInfo& o)
     return ok;
 }
 
-ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
-                  unsigned maxInstr, InstrEmitFn emit, void* emitCtx)
+// ScanTo / ScanToCached 的公共实现。useCache 只影响"怎么拿到这条指令的形状"，
+// 控制流跟随完全一样。
+ScanResult ScanCore(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
+                    unsigned maxInstr, InstrEmitFn emit, void* emitCtx, bool useCache)
 {
     // 跟随控制流时的调用栈深度上限。真实调用链到不了这么深，超了就当"这一段
     // 补不出来"—— 宁缺勿假。
@@ -203,6 +287,10 @@ ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
 
     if (!read) { r.why = "没有读函数"; return r; }
 
+    // 版本校验放在最外层：一次 ScanTo 调用期间镜像不会变（变化只发生在下载/清空，
+    // 那时 trace 不会在解码），所以表项在本次调用里是一致的。
+    if (useCache && !CacheReady()) useCache = false;
+
     // ⚠ **不能**因为 `from == to` 就直接收尾：真机上绝大多数 ETM 地址对都是
     //   "同一个返回地址反复出现"（循环里的调用/返回），那种区间长度为 0，但中间
     //   **执行过一大段**（函数体 + 调用点）。所以照常往下扫，靠"遇到分支"收尾。
@@ -210,22 +298,45 @@ ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
     uint32_t stack[kMaxCallDepth];
     unsigned depth = 0;
 
+    ICacheEntry* ic = useCache ? g_icache : nullptr;
+
     for (unsigned i = 0; i < maxInstr; ++i) {
-        uint8_t  buf[4];
         InstrInfo info;
 
-        if (!read(ctx, pc, buf, 2)) { r.stopPc = pc; r.why = "读不到指令"; return r; }
-        if (!InstrDecode(pc, buf, 2, info)) {
-            // 两种可能：32 位指令的后半还没读到，或者 capstone 解不出来。
-            if (!read(ctx, pc + 2, buf + 2, 2)) {
-                r.stopPc = pc;
-                r.why    = "32 位指令后半读不到";
-                return r;
+        // ---- 快路：这条指令的形状已经解过 ----------------------------------
+        // 命中后既不读镜像（CodeImageRead 的锁 + memcpy 全省）、也不进 capstone。
+        ICacheEntry* e = ic ? &ic[(pc >> 1) & kICacheMask] : nullptr;
+        if (e && e->len && e->pc == pc) {
+            ++g_cacheHits;
+            info.len    = e->len;
+            info.branch = (e->flags & kFlagBranch) != 0;
+            info.direct = (e->flags & kFlagDirect) != 0;
+            info.cond   = (e->flags & kFlagCond)   != 0;
+            info.call   = (e->flags & kFlagCall)   != 0;
+            info.target = e->target;
+        } else {
+            if (e) ++g_cacheMisses;
+
+            uint8_t buf[4];
+            if (!read(ctx, pc, buf, 2)) { r.stopPc = pc; r.why = "读不到指令"; return r; }
+            if (!InstrDecode(pc, buf, 2, info)) {
+                // 两种可能：32 位指令的后半还没读到，或者 capstone 解不出来。
+                if (!read(ctx, pc + 2, buf + 2, 2)) {
+                    r.stopPc = pc;
+                    r.why    = "32 位指令后半读不到";
+                    return r;
+                }
+                if (!InstrDecode(pc, buf, 4, info)) {
+                    r.stopPc = pc;
+                    r.why    = "指令解不出来";
+                    return r;
+                }
             }
-            if (!InstrDecode(pc, buf, 4, info)) {
-                r.stopPc = pc;
-                r.why    = "指令解不出来";
-                return r;
+            if (e) {
+                e->pc     = pc;
+                e->target = info.target;
+                e->len    = static_cast<uint8_t>(info.len);
+                e->flags  = FlagsOf(info);
             }
         }
 
@@ -281,6 +392,26 @@ ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
     r.stopPc = pc;
     r.why    = "超过指令条数上限";
     return r;
+}
+
+ScanResult ScanTo(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
+                  unsigned maxInstr, InstrEmitFn emit, void* emitCtx)
+{
+    return ScanCore(read, ctx, from, to, maxInstr, emit, emitCtx, false);
+}
+
+ScanResult ScanToCached(CodeReadFn read, void* ctx, uint32_t from, uint32_t to,
+                        unsigned maxInstr, InstrEmitFn emit, void* emitCtx)
+{
+    return ScanCore(read, ctx, from, to, maxInstr, emit, emitCtx, true);
+}
+
+void InstrScanGetCacheStats(InstrScanCacheStats& out)
+{
+    out.hits    = g_cacheHits;
+    out.misses  = g_cacheMisses;
+    out.flushes = g_cacheFlushes;
+    out.slots   = g_icache ? kICacheSlots : 0u;
 }
 
 } // namespace agdi

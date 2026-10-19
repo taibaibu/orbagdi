@@ -265,7 +265,7 @@ void Write(int level, const char* fmt, ...) {
     }
     LeaveCriticalSection(&g_cs);
 
-    // 只在真的落盘时送 DebugView：被阈值挡掉的行走这条路等于白送。
+    // 只在真的 cache 时送 DebugView：被阈值挡掉的行走这条路等于白送。
     if (written) OutputDebugStringA(line);
 }
 

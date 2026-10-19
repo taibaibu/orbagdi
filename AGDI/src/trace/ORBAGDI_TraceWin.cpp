@@ -6,7 +6,8 @@
 #include "ORBAGDI_TraceWin.h"
 #include "ORBAGDI_Pdsc.h"
 #include "ORBAGDI_Etb.h"
-#include "ORBAGDI_TraceFile.h"   // TraceFileMark（P2-1 的落盘索引）
+#include "ORBAGDI_TraceFile.h"   // TraceFileMark（P2-1 的 cache 索引）
+#include "ORBAGDI_Cover.h"       // 覆盖率 / 性能分析：每解出一条指令记一次
 
 #include <stdio.h>
 #include <string.h>
@@ -37,9 +38,18 @@ namespace {
 // 记录存 varint 周期差（ETM 7 B/条），每块 256 检查点支持块内半路查询。
 // 追加不取锁（先写字节流、最后发布 usedBytes），结构改动才取 storeLock。
 const unsigned kChunkBytes   = 4u << 20;   // 每块 4 MB（§九：4–16 MB 里取下限）
-// 内存窗口上限 = 物理内存 1/4，封顶 1 GB（防吃光 32 位地址空间）。容量账全按此上限算，
-// 不要缩小；要缩短由用户用 trmem= 调。
-const unsigned kMemLimitMax  = 1u << 30;   // 上限封顶 1 GB
+// 内存窗口上限默认 256 MB（`trmem=` 或环境变量 `ORBAGDI_TRACE_MEM_MB` 可覆盖）。
+//
+// ⚠ 原来是"物理内存 1/4，封顶 1 GB"。2026-10-19 实测推翻了这个上限：抽/解分离之后
+// 解码不再丢数据，ETM 会把分支之间的每条指令展开成记录 ≈ 550 万条/s，**30 秒就攒到
+// 1.03 亿条 / 172 块 / 688 MB**。而 uVision 是 32 位进程，它在 RunStart 之后按这个
+// 条数去取数（1.03 亿 × 16 B ≈ 1.6 GB），拿到数就消失了 —— 日志停在
+// `TraceWin: running=1, 缓冲 103047588 条记录 / 172 块`，之后再无任何输出。
+//
+// 1 GB 的窗口它从来吃不下：设那么大，唯一的效果是让缓冲在崩掉之前先长到不可用的规模。
+// 256 MB ≈ 3800 万条，uVision 侧约 600 MB，是保守的起点；调大前先用
+// `ORBAGDI_TRACE_MEM_MB` 试，别直接改这个常量。
+const unsigned kMemLimitMax  = 256u << 20;
 const unsigned kMemLimitMin  = 16u << 20;  // 上限下限 16 MB
 const unsigned kMemLimitFrac = 4;          // 上限 = 物理内存的 1/4
 // 选项 trchunk= / trmem= 的合理范围（MB）。写错一个数量级不该把会话拖垮。
@@ -51,11 +61,11 @@ const unsigned kCkptPerChunk = 256;
 
 // ---- 记录条数上限（trmax=）----
 // 默认 0 = 不限，只受字节上限约束。旧硬编码 1<<20 在 ETM 下只留 0.13 s 历史，
-// 且就地裁剪不落盘、不报警，架空了内存上限；现在只走整块退休并响亮报错。
+// 且就地裁剪不写 cache、不报警，架空了内存上限；现在只走整块退休并响亮报错。
 const uint64_t kMaxRecsSlack = 4096;       // 超出这么多条才动一次手，摊薄解码成本
 
 
-// ---- 退休队列：抽数 ↔ 落盘的交接层 ----
+// ---- 退休队列：抽数 ↔ cache 的交接层 ----
 // 官方靠 4 槽环解耦（逆向得 4），写满的块只把指针交给后台写线程；
 // 原来在抽数线程同步 fwrite 4 MB，正是实测卡顿的来源。
 const unsigned kRetireQ = 4;
@@ -205,7 +215,7 @@ struct Store {
         // ---- 退休队列 ----
         // 队列有自己的锁 retireLock：写线程腾空槽只需它，不需要 storeLock，避免互等。
     Chunk*           rq[kRetireQ];
-    unsigned         rqHead;        // 队头（最旧，先落盘）
+    unsigned         rqHead;        // 队头（最旧，先写 cache）
     unsigned         rqTail;
     unsigned         rqCount;
     bool             rqBusy;        // 写线程手上正拿着一块（用于 Drain 判"真闲"）
@@ -215,12 +225,12 @@ struct Store {
     HANDLE           rqThread;
     bool             rqStarted;
     // 现场证据（日志用）
-    unsigned long long rqWritten;     // 已落盘块数
+    unsigned long long rqWritten;     // 已写 cache 块数
     unsigned long long rqWaits;       // 抽数为等空槽停下来的次数
-    unsigned long long rqLostChunks;  // 没落盘就丢掉的块数（落盘没开/超时）
+    unsigned long long rqLostChunks;  // 没写 cache 就丢掉的块数（cache 没开/超时）
     unsigned long long rqLostBytes;
     bool               rqLostWarned;  // "丢历史"只报一次（每段）
-    bool               capLostWarned; // "条数上限到顶且没落盘"只报一次（每段）
+    bool               capLostWarned; // "条数上限到顶且没写 cache"只报一次（每段）
 
     Store()
         : head(nullptr), tail(nullptr), freeList(nullptr),
@@ -372,7 +382,7 @@ void RetireStart()
     s.rqWork  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     s.rqSpace = CreateEventW(nullptr, FALSE, TRUE,  nullptr);   // 初始 4 个空槽
     if (!s.rqWork || !s.rqSpace) {
-        ORB_LOG_WARN("TraceWin: 退休队列的事件建不出来 —— 落盘退回同步写");
+        ORB_LOG_WARN("TraceWin: 退休队列的事件建不出来 —— cache 写退回同步");
         if (s.rqWork)  { CloseHandle(s.rqWork);  s.rqWork  = nullptr; }
         if (s.rqSpace) { CloseHandle(s.rqSpace); s.rqSpace = nullptr; }
         return;                      // rqStarted 保持 false ⇒ 调用方走同步兜底
@@ -382,13 +392,13 @@ void RetireStart()
     s.rqThread = reinterpret_cast<HANDLE>(
         _beginthreadex(nullptr, 0, RetireBody, nullptr, 0, &tid));
     if (!s.rqThread) {
-        ORB_LOG_WARN("TraceWin: 落盘写线程创建失败 —— 退回同步写");
+        ORB_LOG_WARN("TraceWin: cache 写线程创建失败 —— 退回同步写");
         CloseHandle(s.rqWork);  s.rqWork  = nullptr;
         CloseHandle(s.rqSpace); s.rqSpace = nullptr;
         return;
     }
     s.rqStarted = true;
-    ORB_LOG_INFO("TraceWin: 落盘写线程已启动（交接队列 %u 槽 / 每块 %u MB）"
+    ORB_LOG_INFO("TraceWin: cache 写线程已启动（交接队列 %u 槽 / 每块 %u MB）"
                  "—— 抽数不再等磁盘 I/O",
                  kRetireQ, static_cast<unsigned>(s.chunkCapBytes >> 20));
 }
@@ -398,16 +408,16 @@ bool RetirePush(Chunk* c)
 {
     Store& s = S();
 
-        // 装不下又落不了盘 ⇒ 历史真的丢了，置 T_ERR_DATA_OVF 上报，不能静默。
+        // 装不下又写不进 cache ⇒ 历史真的丢了，置 T_ERR_DATA_OVF 上报，不能静默。
     if (!TraceFileRecordsActive()) {
         s.rqLostChunks++;
         s.rqLostBytes += c->usedBytes - c->headOfs;
         if (!s.rqLostWarned) {
             s.rqLostWarned = true;
             ORB_LOG_ERROR("TraceWin: 内存缓冲已满（上限 %u 块 / %llu MB）而"
-                          "**记录日志没开** —— 最旧的历史正在被丢弃。"
-                          "要留住它：选项串加 `trrec=1`（落 %TEMP%），"
-                          "或调大 trmem=",
+                          "**记录 cache 没开或已到上限（trrecmb=）** —— 最旧的历史"
+                          "正在被丢弃。要留住它：选项串加 `trrec=1`、调大 "
+                          "trrecmb=，或调大 trmem=",
                           s.maxChunks, s.memLimit >> 20);
             TraceWinErrorSet(kTErrDataOvf);
         }
@@ -438,9 +448,9 @@ bool RetirePush(Chunk* c)
             s.rqLostBytes += c->usedBytes - c->headOfs;
             if (!s.rqLostWarned) {
                 s.rqLostWarned = true;
-                ORB_LOG_ERROR("TraceWin: 落盘跟不上（队列 %u 块全满，等了 %u ms）"
+                ORB_LOG_ERROR("TraceWin: cache 跟不上（队列 %u 块全满，等了 %u ms）"
                               "—— 丢弃最旧的一块以保住抽数（磁盘太慢？"
-                              "trrecmb= 到顶后落盘会停，检查那一条）",
+                              "trrecmb= 到顶后 cache 会停，检查那一条）",
                               kRetireQ, kRetireWaitMs);
                 TraceWinErrorSet(kTErrDataOvf);
             }
@@ -465,7 +475,7 @@ void RetireDrain()
         if (idle) return;
 
         if (GetTickCount64() - t0 > (kRetireWaitMs * 4)) {
-            ORB_LOG_WARN("TraceWin: 等落盘写线程超时（队列还剩 %u 块）—— 不再等",
+            ORB_LOG_WARN("TraceWin: 等 cache 写线程超时（队列还剩 %u 块）—— 不再等",
                          left);
             return;
         }
@@ -502,7 +512,7 @@ bool Ensure()
     Store& s = S();
     if (s.idx) return true;
 
-        // 块大小与上限（默认 4 MB/块，上限物理内存 1/4 封顶 1 GB）。
+        // 块大小与上限（默认 4 MB/块，上限物理内存 1/4 封顶 256 MB）。
         // 惰性分配：没开 trace 的会话一个字节缓冲都不占。chunkCapBytes 是字节数。
     const unsigned chunkMB = s.reqChunkMB ? s.reqChunkMB : (kChunkBytes >> 20);
     s.chunkCapBytes = chunkMB << 20;
@@ -513,6 +523,20 @@ bool Ensure()
         limit = static_cast<unsigned long long>(s.reqMemMB) << 20;
     } else {
         limit = kMemLimitMax;
+
+        // 环境变量覆盖（16..2048 MB）：不改 uVision 的选项串也能二分"多大窗口不崩"。
+        // 选项串 `trmem=` 仍然优先（走上面那一支）。
+        {
+            char  v[32] = {0};
+            const DWORD n = GetEnvironmentVariableA("ORBAGDI_TRACE_MEM_MB", v, sizeof(v));
+            if (n > 0 && n < sizeof(v)) {
+                const int k = atoi(v);
+                if (k >= 16 && k <= 2048) {
+                    limit = static_cast<unsigned long long>(k) << 20;
+                    ORB_LOG_INFO("TraceWin: 内存窗口上限被环境变量覆盖 = %d MB", k);
+                }
+            }
+        }
         MEMORYSTATUSEX ms;
         memset(&ms, 0, sizeof(ms));
         ms.dwLength = sizeof(ms);
@@ -539,8 +563,8 @@ bool Ensure()
         return false;
     }
     ORB_LOG_INFO("TraceWin: 记录缓冲 = 块链 %u MB/块（%u 字节流 + %u 检查点），"
-                 "上限 %u 块 / %llu MB（物理内存 1/4 封顶 1 GB，惰性分配）；"
-                 "落盘交接队列 %u 槽 —— 在飞的块另计，最多再占 %u MB",
+                 "上限 %u 块 / %llu MB（物理内存 1/4 封顶 256 MB，惰性分配）；"
+                 "cache 交接队列 %u 槽 —— 在飞的块另计，最多再占 %u MB",
                  chunkMB, s.chunkCapBytes, kCkptPerChunk,
                  s.maxChunks, s.memLimit >> 20,
                  kRetireQ, (kRetireQ + 1u) * chunkMB);
@@ -595,9 +619,9 @@ Chunk* DropOldest(bool markFile = true)
         // 摘掉的块一定写满，比值即实测每条字节数；要减去已裁掉的前缀 headOfs。
     s.retiredBytes += c->usedBytes - c->headOfs;
     s.retiredRecs  += c->nRecs;
-        // 落盘索引：这段历史刚离开内存，记下它在文件里的位置。
+        // cache 索引：这段历史刚离开内存，记下它在文件里的位置。
     if (markFile) TraceFileMark(c->lastCycle);
-        // 记录日志由写线程在 RetirePush 之后写；原来在这里同步写，正是卡顿原因。
+        // 记录 cache 由写线程在 RetirePush 之后写；原来在这里同步写，正是卡顿原因。
     if (s.idxCount) {
         memmove(s.idx, s.idx + 1, (s.idxCount - 1u) * sizeof(Chunk*));
         --s.idxCount;
@@ -669,11 +693,11 @@ Chunk* NewWriteChunk()
         s.count -= c->nRecs;
         s.retiredBytes += c->usedBytes - c->headOfs;  // 同上，且要减掉已裁前缀
         s.retiredRecs  += c->nRecs;
-        TraceFileMark(c->lastCycle);         // 落盘索引（P2-1），同上
+        TraceFileMark(c->lastCycle);         // cache 索引（P2-1），同上
         if (TraceFileRecordsActive()) {
-            // ★ 空块守卫，同落盘线程：裁空的块不写 0 长度段、不打空 mark。
+            // ★ 空块守卫，同 cache 线程：裁空的块不写 0 长度段、不打空 mark。
             if (c->usedBytes > c->headOfs) {
-                TraceFileMarkRecords(c->headFirstCycle);              // 记录日志：先记索引
+                TraceFileMarkRecords(c->headFirstCycle);              // 记录 cache：先记索引
                 TraceFileWriteRecords(c->buf + c->headOfs,
                                       c->usedBytes - c->headOfs);     // 再追加字节流
             }
@@ -682,7 +706,7 @@ Chunk* NewWriteChunk()
             s.rqLostBytes += c->usedBytes - c->headOfs;
             if (!s.rqLostWarned) {
                 s.rqLostWarned = true;
-                ORB_LOG_ERROR("TraceWin: 只有一块缓冲、记录日志又没开 —— "
+                ORB_LOG_ERROR("TraceWin: 只有一块缓冲、记录 cache 又没开 —— "
                               "历史被丢弃。要留住它：选项串加 `trrec=1`");
                 TraceWinErrorSet(kTErrDataOvf);
             }
@@ -779,11 +803,30 @@ static void SyncAxisToWall(Store& s);
 // 记录级上限的执行者，声明必须在 AppendRec 之前（否则 C3861）。
 void EnforceRecCap(Store& s);
 
-// 热路径不取锁：3.96–7.80 M 条/s，一条一取锁要吃掉一个核。块满才走 NewWriteChunk。
+// ⚠ 这里**必须**取 storeLock，别再退回"热路径不取锁"。
+//
+// 那条注释当年成立的前提是：追加只有两个入口（ITM 的 TraceWinItmByte、ETM 的
+// TraceWinEtmInstruction），而**两者都在 ComLock 里**（worker 的 OrbTracePump 也在锁内），
+// 所以追加实际上是被 ComLock 串行化的，AppendRec 自己不用锁。
+//
+// 抽 / 解拆成两条线程之后，这个前提没了：解码线程不持 ComLock，与调试线程的
+// TryTraceGetRecord / GetFirstCycle 以及抽数线程的 ITM 追加同时动 s.tail、s.usedBytes、
+// s.count、c->nRecs。实测后果是记录链被写坏 —— uVision 读到半条记录后直接崩，
+// 日志停在采集开始后 10 s（`AG_GOFORBRK still waiting (10 s)` 之后一声不响）。
+//
+// 死锁方面的结论（都核对过）：
+//   · NewWriteChunk() 里也取 StoreGuard —— 临界区可重入，同线程不会自锁；
+//   · RetirePush() 等槽时持着本锁，但写线程"腾槽"只走 retireLock（SetEvent 在还块之前），
+//     需要 storeLock 的只是"还块"，我们不等它还块 ⇒ 不互等（同 RetireDrain 的说明）；
+//   · 锁序始终是 ComLock → storeLock，没有任何路径反向取 ⇒ 与调试线程无环。
+//
+// 代价：ETM 约 1.18 M 条/s，每条一次无竞争 Enter/Leave ≈ 2–4% 单核；真正要防的是
+// "UI 线程读记录时把解码线程挡住"，那是锁竞争的固有代价，换掉的是一条必崩的路径。
 void AppendRec(uint8_t type, uint8_t flags, uint32_t pc, uint32_t addr,
                uint32_t data, uint32_t advance)
 {
     Store& s = S();
+    StoreGuard g;
 
         // ---- bTS：这条记录的周期号是不是真实时间（Time 列要靠它填）----
         // 轴有真实来源时才置 1；放在这里是因为 8 处调用都要这一位。
@@ -885,7 +928,7 @@ void AppendRec(uint8_t type, uint8_t flags, uint32_t pc, uint32_t addr,
     if (s.recCap && s.count > s.recCap + kMaxRecsSlack) EnforceRecCap(s);
 }
 
-// ---- 紧凑记录的解码（按字节范围，内存块与记录日志共用）----
+// ---- 紧凑记录的解码（按字节范围，内存块与记录 cache 共用）----
 // cycleAtFirst 是该处第一条记录的绝对周期号，逐条还原成 TRACE_RECORD_64。
 struct RecIter {
     const uint8_t*  p;
@@ -969,22 +1012,22 @@ struct RecIter {
     }
 };
 
-// trmax 执行者：走整块退休而非就地裁剪（就地裁剪不落盘不报警，现场曾静默丢 8160 万条）。
-// 记录日志开着就落盘，没开就报 ERROR 并置 overflow；默认 recCap==0 不调用。
+// trmax 执行者：走整块退休而非就地裁剪（就地裁剪不写 cache 不报警，现场曾静默丢 8160 万条）。
+// 记录 cache 开着就写 cache，没开就报 ERROR 并置 overflow；默认 recCap==0 不调用。
 void EnforceRecCap(Store& s)
 {
     while (s.recCap && s.count > s.recCap) {
                 // 再摘就把链摘空（单块环，没有更旧的历史）⇒ 停手，交给内存上限兜底。
         if (s.idxCount < 2) break;
 
-                // 摘之前先问有没有人接：记录日志没开 ⇒ 摘了就是真丢。只报一次然后停手。
+                // 摘之前先问有没有人接：记录 cache 没开 ⇒ 摘了就是真丢。只报一次然后停手。
         if (!TraceFileRecordsActive()) {
             if (!s.capLostWarned) {
                 s.capLostWarned = true;
-                ORB_LOG_ERROR("TraceWin: 记录条数上限（trmax=%llu）到顶，而**记录日志"
-                              "没开** —— 最旧的历史会被丢弃（当前常驻 %llu 条）。"
-                              "要留住它：去掉 trmax=（改用 trmem= 控窗口），"
-                              "或加 `trrec=1`（落 %TEMP%）",
+                ORB_LOG_ERROR("TraceWin: 记录条数上限（trmax=%llu）到顶，而**记录 cache"
+                              "没开或已到上限（trrecmb=）** —— 最旧的历史会被丢弃"
+                              "（当前常驻 %llu 条）。要留住它：去掉 trmax=（改用 "
+                              "trmem= 控窗口），或加 `trrec=1` / 调大 trrecmb=",
                               static_cast<unsigned long long>(s.recCap),
                               static_cast<unsigned long long>(s.count));
                 // 与整块退休那条路**同一个**错误位：状态栏要看得见，绝不静默。
@@ -1010,7 +1053,7 @@ void EnforceRecCap(Store& s)
 
 const unsigned kReplayBuf = 64u * 1024;
 
-// 从记录日志回放 [lo, hi]，与内存路径共用同一套命中/过滤/偏移计数。
+// 从记录 cache 回放 [lo, hi]，与内存路径共用同一套命中/过滤/偏移计数。
 // 必须按索引逐段解：每块首条记录存的是“差 = 0”，跨块线性解每个边界漂一点，
 // 实测 407 个边界累积错位 304 条。段边界上要重新锚定周期号。
 template <typename Fn>
@@ -1331,6 +1374,16 @@ void StatusUpdate(bool processing, bool updateView)
                  (unsigned long long)(st.m_pRecordRange ? g_recRange.nFirstCycle : 0),
                  (unsigned long long)(st.m_pRecordRange ? g_recRange.nLastCycle : 0),
                  (unsigned)rc);
+
+        // 覆盖率自检：只在停止/挂起时打（processing=0 的那次）。窗口显示 0 时，
+        // 先看这行 —— >0 说明执行位确实标上了，问题在 uVision 读的另一条路；
+        // =0 说明解码没走 TraceWinEtmInstruction()（没有 ETM 源）。
+    if (!processing) {
+        ORB_LOG_INFO("Cover: %u 段 / %llu 个 DWORD 带执行位 / %llu 条指令计数",
+                     orb::cover::SegmentCount(),
+                     static_cast<unsigned long long>(orb::cover::MarkedWords()),
+                     static_cast<unsigned long long>(orb::cover::ExecCountRange(0u, 0xFFFF0000u)));
+    }
 }
 
 void Configure(struct bom* bom)
@@ -1561,7 +1614,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
     // 拖动时间轴会连打几十次查询，所以这里必须有可量化的证据（见收尾处的 WARN）。
     const uint64_t t0 = GetTickCount64();
 
-    // 内存为空**不再直接判 EMPTY**：记录日志（P2-2）里可能还有整段历史。
+    // 内存为空**不再直接判 EMPTY**：记录 cache（P2-2）里可能还有整段历史。
     // `ReplayRecordsFromFile` 会自己判断"文件里有没有这一段"。
     const uint64_t lo    = *nFirstCycle;
     const uint64_t hi    = *nLastCycle;
@@ -1571,7 +1624,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
 
     // 只问条数（pTrace64==NULL && *nCount==0）时在索引上数，不解整段：原来逐条解码，
     // 1.04 亿条要 1453 ms 卡在 UI 线程。整块落在区间内直接加 nRecs，只有两个边界块要
-    // 从"周期号 <= lo 的最后一个检查点"起解。仅过滤器全通过且不在记录日志段时走此快路。
+    // 从"周期号 <= lo 的最后一个检查点"起解。仅过滤器全通过且不在记录 cache 段时走此快路。
     if (!out && cap == 0 && skip == 0 && FilterPassAll(filter) && s.count && s.head) {
         const Chunk*   rdHead0 = FirstReadable(s);
         const uint64_t first0 = rdHead0 ? rdHead0->headFirstCycle : 0;
@@ -1681,7 +1734,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
     };
 
     // 记录来源计数（只用于日志）。真 uVision 里"拖 Navigation 条回到内存窗口之前"
-    // 是否真的落到记录日志上，从这里唯一能看出来 —— 否则 P2-2 只有假 BOM 宿主
+    // 是否真的落到记录 cache 上，从这里唯一能看出来 —— 否则 P2-2 只有假 BOM 宿主
     // 那一条证据（§0.3）。包一层，不动 consider 的语义。
     uint64_t fileHits = 0, memHits = 0;
     auto considerFile = [&](const TRACE_RECORD_64& r) { ++fileHits; consider(r); };
@@ -1719,7 +1772,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
         }
     }
 
-    // 内存窗口之前那段从记录日志回放：按周期号定位文件偏移，用同一套解码展开，顺序上必在
+    // 内存窗口之前那段从记录 cache 回放：按周期号定位文件偏移，用同一套解码展开，顺序上必在
     // 内存之前，故先回放再走内存，nRecordOfs 语义与从头扫一致。游标续扫时必须跳过，否则重复交付。
     const Chunk*   rdHeadM = FirstReadable(s);
     const uint64_t memFirst = rdHeadM ? rdHeadM->headFirstCycle : 0;
@@ -1729,7 +1782,7 @@ INT32 QueryRange(UINT64* nFirstCycle, UINT64* nLastCycle, UINT64* nCount,
     }
 
     if (s.count == 0) {
-        if (!inRange) { LogQuery("EMPTY (内存 0 条，记录日志里也没有这一段)"); return TDI_ERR_EMPTY; }
+        if (!inRange) { LogQuery("EMPTY (内存 0 条，记录 cache 里也没有这一段)"); return TDI_ERR_EMPTY; }
         // 全在文件里 —— 后面内存那段自然一条都不出。
     }
 
@@ -1874,7 +1927,7 @@ INT32 GetFirstCycle(UINT64* nFirstCycle)
     const Store& s = S();
     StoreGuard guard;
     if (s.count == 0 || !s.head) {
-        // 内存里一块都没有 —— 整段历史可能都在记录日志里（P2-2）。
+        // 内存里一块都没有 —— 整段历史可能都在记录 cache 里（P2-2）。
         uint64_t f = 0, l = 0;
         if (!TraceFileRecordsRange(f, l)) return TDI_ERR_EMPTY;
         *nFirstCycle = f;
@@ -1882,7 +1935,7 @@ INT32 GetFirstCycle(UINT64* nFirstCycle)
     }
 
     // 可查范围左端报本段起点（segFirstCycle），不是最旧可读：报晚了 Navigation 条只画内存那一小段。
-    // 历史真被丢掉时也报起点（状态栏已有 Data Overflow），再与记录日志左端取更早者。
+    // 历史真被丢掉时也报起点（状态栏已有 Data Overflow），再与记录 cache 左端取更早者。
     uint64_t first = FirstReportedCycle(s);
     uint64_t f = 0, l = 0;
     if (TraceFileRecordsRange(f, l) && f < first) first = f;
@@ -1912,12 +1965,12 @@ INT32 GetLastCycle(UINT64* nLastCycle)
     *nLastCycle = last;
 
     // 同 GetFirstCycle：这个值就是 uVision 算时间轴的右端，必须留证据。
-    // 注意**没有**把 `TraceFileRecordsRange()` 的上界并进来（P2-2 的落盘段在内存窗口
+    // 注意**没有**把 `TraceFileRecordsRange()` 的上界并进来（P2-2 的 cache 段在内存窗口
     // 之后）—— 若 uVision 的时间轴右端大于这里报的值，就是它自己在算，不是读我们的。
     uint64_t ff = 0, fl = 0;
     const bool haveFile = TraceFileRecordsRange(ff, fl);
     ORB_LOG_INFO("TraceWin: [2] GetLastCycle -> %llu（周期时钟 %u Hz，内存 %llu 条；"
-                 "落盘段 %s%s%llu）",
+                 "cache 段 %s%s%llu）",
                  (unsigned long long)last, g_coreClkHz,
                  (unsigned long long)s.count,
                  haveFile ? "" : "无", haveFile ? "上界 " : "",
@@ -2583,6 +2636,12 @@ void TraceWinExceptionTrace(uint32_t packed)
 
 void TraceWinEtmInstruction(uint32_t addr, bool executed)
 {
+        // 覆盖率 / 性能分析共用这一处：解码出的每条指令就是"执行过的地址"。
+        // ⚠ 放在 TraceWinReady() 判断**之前**：覆盖率不依赖记录缓冲是否就绪
+        // （Trace 窗口没开也要能统计），否则关了 Trace 窗口覆盖率就是空的。
+        // 内部稳态无锁，只在跨 64 kB 段时取一次锁。
+    orb::cover::OnInstruction(addr, executed);
+
     if (!TraceWinReady()) return;
 
     AppendRec(TR_TYPE_ETM,
@@ -2696,7 +2755,7 @@ void TraceWinCycleAxisLog(const char* where)
     ORB_LOG_INFO("TraceWin: buf(%s) 块峰值=%u/%u（每块 %u MB）记录峰值=%llu "
                  "满块均=%llu B/条（%llu 块）持有=%llu MB 上限=%llu MB "
                  "条数上限=%llu 摘块=%llu 分配失败=%llu 退化=%llu 丢记录=%llu "
-                 "落盘=%llu 块 等盘=%llu 次 丢历史=%llu 块/%llu MB "
+                 "cache=%llu 块 等 cache=%llu 次 丢历史=%llu 块/%llu MB "
                  // `条数上限` = trmax= 的值，0 才正常；非 0 时 `上限裁掉` > 0 说明条数上限真动过手。
                  // `本段起点` 就是 GetFirstCycle 报的位置；`累计写入(本段)` = recSeq，与三项相加应相等。
                  "上限裁掉=%llu 条 本段起点=%llu 累计写入(本段)=%llu 条",
@@ -2722,7 +2781,7 @@ void TraceWinSetBuffer(unsigned chunkMB, unsigned limitMB, unsigned long long re
     if (s.recCap != recMax) {
         s.recCap = recMax;
         ORB_LOG_INFO("TraceWin: 记录条数上限 = %llu 条（0 = 不限：窗口只受 %u MB 字节"
-                     "上限约束；非 0 时触顶走整块退休 —— 记录日志开着就落盘，"
+                     "上限约束；非 0 时触顶走整块退休 —— 记录 cache 开着就写 cache，"
                      "没开就报 Data Overflow）",
                      recMax, limitMB);
     }
@@ -2768,7 +2827,7 @@ void TraceWinClear()
 {
     Store& s = S();
 
-    // ⚠ **先等在飞的块落完盘**：写线程手上可能还拿着块，不等它把块还回来就把整条链
+    // ⚠ **先等在飞的块写完 cache**：写线程手上可能还拿着块，不等它把块还回来就把整条链
     //   搬进空闲链，会出现"一块同时属于空闲链和写线程"的双重归属。
     //   必须在取结构锁**之前**做 —— 写线程要取结构锁才能还块（见 RetireDrain）。
     RetireDrain();
@@ -2836,7 +2895,7 @@ void TraceWinClear()
     s.segStartTick = GetTickCount64();
     s.segStopTick  = 0;             // 新的一段：墙钟重新开始走
 
-    // 落盘（P2-2）：记录日志里"内存窗口之前那一段"也一起清掉 —— 否则清空窗口之后
+    // cache（P2-2）：记录 cache 里"内存窗口之前那一段"也一起清掉 —— 否则清空窗口之后
     // 还能把旧记录翻出来（TDI 的 ClearTrace 语义是"清空"）。
     TraceFileClearRecords();
 
@@ -2876,14 +2935,14 @@ void TraceWinSetRunning(bool bState, bool bUpdate)
         s.peakChunks = s.idxCount;
 
         // 退休队列（P3-1）的账目同样按段清：这几项是"交接层到底有没有起作用"
-        // 的判据 —— 落盘块数 > 0 说明异步落盘真的跑了；丢历史块数 > 0 说明
+        // 的判据 —— cache 块数 > 0 说明异步写 cache 真的跑了；丢历史块数 > 0 说明
         // 内存/磁盘都没接住（那时状态栏同时会有 Data Overflow）。
         s.rqWritten    = 0;
         s.rqWaits      = 0;
         s.rqLostChunks = 0;
         s.rqLostBytes  = 0;
         s.rqLostWarned = false;
-        // "条数上限到顶且没落盘"同样每段只吼一次（判据见 EnforceRecCap）。
+        // "条数上限到顶且没写 cache"同样每段只吼一次（判据见 EnforceRecCap）。
         s.capLostWarned = false;
 
         // "被拒增量"计数按段清零（墙钟起点已在上面、`StatusUpdate()` 之前定好）。
