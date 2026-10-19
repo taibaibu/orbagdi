@@ -1,0 +1,56 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "ORBMDK (MSVC x86 / C++17)",
+            "compilerPath": "D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx86/x86/cl.exe",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/test",
+                "${workspaceFolder}/tools",
+                "D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/include",
+                "C:/Program Files/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*/include",
+                "D:/Program Files/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*/include",
+                "D:/Windows Kits/10/Include/10.0.26100.0/ucrt",
+                "D:/Windows Kits/10/Include/10.0.26100.0/shared",
+                "D:/Windows Kits/10/Include/10.0.26100.0/um",
+                "D:/Windows Kits/10/Include/10.0.26100.0/winrt",
+                "C:/Program Files (x86)/Windows Kits/10/Include/*/ucrt",
+                "C:/Program Files (x86)/Windows Kits/10/Include/*/shared",
+                "C:/Program Files (x86)/Windows Kits/10/Include/*/um",
+                "C:/Program Files (x86)/Windows Kits/10/Include/*/winrt",
+                "D:/Windows Kits/10/Include/*/ucrt",
+                "D:/Windows Kits/10/Include/*/shared",
+                "D:/Windows Kits/10/Include/*/um",
+                "D:/Windows Kits/10/Include/*/winrt"
+            ],
+            "defines": [
+                "_WINDOWS",
+                "_USRDLL",
+                "ORBMDK_EXPORTS",
+                "WIN32",
+                "_WINDLL",
+                "NOMINMAX",
+                "WIN32_LEAN_AND_MEAN",
+                "_CRT_SECURE_NO_WARNINGS",
+                "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS",
+                "UMDF_USING_IOCTL_DEFINE_GUIDS",
+                "COBJMACROS",
+                "INITGUID"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x86",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/src",
+                    "${workspaceFolder}/include",
+                    "${workspaceFolder}/test"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ]
+}

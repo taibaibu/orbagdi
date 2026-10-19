@@ -1,0 +1,45 @@
+// ---------------------------------------------------------------------------
+// ORB_AGDI.dll - version resource
+//
+// The numbers come from include\ORBAGDI_Version.h, the same header the C++ side
+// uses for the session banner.  Nothing personal goes in here: the strings that
+// Windows shows in the file properties are the product name and the layer the
+// DLL plugs into, not an author or a machine.
+//
+// VS_VERSION_INFO must be the numeric id 1, the way the SDK templates write it
+// (`#define VS_VERSION_INFO 1`).  Spelling it as a bare name compiles, but rc
+// then stores RT_VERSION under a *string* name next to an empty stub entry, and
+// GetFileVersionInfo() ends up returning nothing at all.
+// ---------------------------------------------------------------------------
+#include "ORBAGDI_Version.h"
+
+#define VS_VERSION_INFO 1
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    ORBAGDI_VERSION_COMMA
+ PRODUCTVERSION ORBAGDI_VERSION_COMMA
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L            // release build, no debug / prerelease bits
+ FILEOS         0x40004L        // VOS_NT_WINDOWS32
+ FILETYPE       0x2L            // VFT_DLL
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"        // en-US, Unicode
+        BEGIN
+            VALUE "CompanyName",      "ORBAGDI"
+            VALUE "FileDescription",  "ORBAGDI - CMSIS-DAP AGDI driver for Keil uVision (MDK)"
+            VALUE "FileVersion",      ORBAGDI_VERSION_STRING
+            VALUE "InternalName",     "ORB_AGDI"
+            VALUE "LegalCopyright",   "ORBAGDI contributors"
+            VALUE "OriginalFilename", "ORB_AGDI.dll"
+            VALUE "ProductName",      "ORBAGDI"
+            VALUE "ProductVersion",   ORBAGDI_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
