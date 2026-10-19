@@ -1,35 +1,17 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// A1: Flash download - the FlashOS path.
-//
-// "FlashOS" is Keil's name for the whole flash-programming system: a FlashDevice
-// description plus a set of programming functions (Init / EraseSector /
-// ProgramPage / Verify / ...) that run on the target out of a .FLM image, with
-// the driver as the host side of it.  Both halves are here.
-//
-// The work is split the non-obvious way round: uVision hands the programming
-// job to the driver DLL and expects the DLL to pull the image from it.
-//
-//   AG_Init(AG_INITITEM | AG_INITFLASHLOAD)  -> load the .FLM into target RAM
-//                                               and run its Init()
-//   AG_Init(AG_INITITEM | AG_STARTFLASHLOAD) -> EraseAll / WriteAll / VerifyAll
-//   pCbFunc(AG_CB_GETFLASHPARAM)             -> DLL pulls {start,many,image}
-//   DllUv3Cap(100)                           -> advertises the capability
-//   AG_MemAcc(AG_F_ERASE)                    -> Flash / Erase in uVision's menu
-//   AG_MemAcc(AG_F_RUN)                      -> Flash / Run
-//
-// A device whose CMSIS-Pack debug description carries flash sequences is flashed
-// through uVision's sequence interpreter instead of an FLM; FlashInitLoad()
-// picks between the two and the rest of the module follows that choice.
-// ---------------------------------------------------------------------------
+// Flash 下载（FlashOS 路径）。
+// uVision 把编程任务交给驱动 DLL，由 DLL 反过来向它拉取镜像：
+//   AG_INITFLASHLOAD  -> 载入 .FLM 到目标 RAM 并跑 Init()
+//   AG_STARTFLASHLOAD -> EraseAll / WriteAll / VerifyAll
+//   AG_CB_GETFLASHPARAM -> {start,many,image}
+// 器件描述里带 flash 序列时改走 uVision 的序列解释器，由 FlashInitLoad() 选择。
 
 namespace orb {
 namespace agdi {
 
-// Sniff the FLM path and RAM window out of the driver option string uVision
-// keeps in the project (EnumUvARM7 gets it as DEV_X66::TargArgs).
-// Accepted forms:  -FL"<file>.FLM"   flm=<file>   ram=<addr>,<size>
+// 从驱动选项串里取 FLM 路径与 RAM 窗口。
+// 接受 -FL"<file>.FLM"、flm=<file>、ram=<addr>,<size>。
 void FlashOptions(const char* targArgs);
 
 const char* FlashFilePath();       // "" when no algorithm is configured
@@ -39,12 +21,10 @@ bool FlashInitLoad();              // AG_INITITEM | AG_INITFLASHLOAD
 bool FlashStartLoad();             // AG_INITITEM | AG_STARTFLASHLOAD
 void FlashUnInit();                // AG_UNINIT / target unhook
 
-// AG_MemAcc(AG_F_ERASE): uVision's Flash / Erase.  Brings the algorithm up when
-// no download has run yet, then erases the whole device.
+// AG_MemAcc(AG_F_ERASE)：还没下载过就先拉起算法，然后整片擦除。
 bool FlashEraseChip();
 
-// AG_MemAcc(AG_F_RUN): uVision's Flash / Run - reset the target and let the
-// freshly programmed application go.
+// AG_MemAcc(AG_F_RUN)：复位并放行刚烧进去的程序。
 bool FlashRunApp();
 
 const char* FlashLastError();

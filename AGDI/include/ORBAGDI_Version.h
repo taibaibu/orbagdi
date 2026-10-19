@@ -1,15 +1,7 @@
 /**
  * @file ORBAGDI_Version.h
- * @brief Release version - the single place it is written down.
- *
- * Included by both C++ (ORBAGDI.h, for the session banner) and the resource
- * compiler (ORBAGDI.rc, for the DLL's VERSIONINFO), so the number the log
- * prints, the number Explorer shows and the number in the README cannot drift
- * apart.  Keep this file free of anything the RC preprocessor cannot parse -
- * no C++, no windows.h, plain integer macros only.
- *
- * Release rule: bump here, add the entry to README.md "Version history", and
- * rebuild.  `.\build.ps1` recompiles the resource automatically.
+ * @brief 版本号唯一出处，C++ 与资源编译器共用。
+ * 只能写整数宏：RC 预处理器解析不了 C++ 和 windows.h。
  */
 #pragma once
 

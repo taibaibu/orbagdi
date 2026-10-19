@@ -22,14 +22,9 @@
 
 namespace orb {
 
-// AG_MemAtt() attribute bits (own definition; ARM does not ship them).
-//
-// These used to be macros named ATR_READ / ATR_WRITE / ATR_EXEC / ATR_BREAK,
-// which collide with BOM.H's identically-named set that means something
-// different (there ATR_EXEC is 0x01, here 0x04).  As macros, whichever header
-// was included first silently won - the C4005 the compiler emits was the only
-// hint that the value could differ.  Typed constants inside a namespace cannot
-// be shadowed by a #define, so the ambiguity is gone for good.
+// AG_MemAtt() 属性位（自定义，ARM 没有提供）。
+// 用 constexpr 而不是宏：BOM.H 里有同名但取值不同的 ATR_* 宏，宏会被先包含者
+// 静默覆盖，命名空间常量则不会被 #define 遮蔽。
 inline constexpr uint32_t kAtrRead  = 0x00000001u;
 inline constexpr uint32_t kAtrWrite = 0x00000002u;
 inline constexpr uint32_t kAtrExec  = 0x00000004u;
@@ -58,10 +53,8 @@ public:
     int  Count() const { return m_used; }
     int  Capacity() const { return m_hwSlots + kMaxSwSlots + m_wpSlots; }
 
-    // FP_CTRL[31:28] - the FPB revision.  It decides whether a comparator can be
-    // used outside the code region: rev 0 is restricted to addresses below
-    // 0x20000000, so a breakpoint in RAM has to become a software breakpoint
-    // (DbgCM/AGDI.CPP:5535 `if ((FPB_Ver > 0) || pB->Adr < 0x20000000)`).
+    // FPB 版本（FP_CTRL[31:28]）。
+    // rev0 的比较器只能覆盖 0x20000000 以下，RAM 断点必须退化成软件断点。
     int  FpbRev() const { return m_fpbRev; }
 
     // Returns true when the breakpoint had to be implemented in hardware.
@@ -82,27 +75,13 @@ public:
     void Clear();          // uninstall everything (target unload)
     void ResetDetection(); // re-detect FPB/DWT (new target)
 
-    // Re-install every registered comparator after a debug-access recovery.
-    //
-    // Counterpart of the reference's `_BreakpointUnitRecovery()` /
-    // `_WatchpointUnitRecovery()` (DbgCM/DebugAccess.cpp:336-397), which write the
-    // cached `RegFPB` / `RegDWT` images back to the target.  This driver keeps no
-    // register image, so it reinstalls per slot instead - same effect, and it can
-    // never write back a comparator uVision never asked for.
-    //
-    // Deliberately does **not** re-probe capacities: the device's capabilities do
-    // not change when the link is repaired, and re-probing would disturb what
-    // uVision has already laid out.
+    // 调试访问恢复后按槽位重装比较器。
+    // 不重探容量：链路修复不改变器件能力，重探会打乱 uVision 已排好的布局。
     bool Recover();
 
-    // Uninstall every breakpoint and watchpoint from the target but keep the
-    // entries, so our list and uVision's stay in step.
-    //
-    // AG_BpInfo(AG_BPDISALL) means *disable*, not delete: the reference walks its
-    // list and sets ATRX_BPDIS on each entry rather than dropping anything
-    // (DbgCM/AGDI.CPP:7529).  Both cases used to call Clear(), so a disable
-    // looked like a delete and uVision's markers flickered against an attribute
-    // table that had just been emptied.  Returns how many were disabled.
+    // 卸下全部断点/观察点但保留条目（AG_BPDISALL 是禁用不是删除）。
+    // 早期误用 Clear() 会让 uVision 的标记跟着属性表一起消失。
+    // 返回被禁用的数量。
     int  DisableAll();
 
     // Addresses currently held, for a caller that has to update its own

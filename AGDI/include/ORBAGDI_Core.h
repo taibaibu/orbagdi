@@ -50,9 +50,8 @@ enum : uint32_t {
 };
 
 // ---- DWT: data watchpoints (v6-M/v7-M function codes) --------------------
-// DWT control/compare registers. Comparator n sits at kDwtComp + 16*n, with
-// MASK at +4 and FUNCTION at +8. DWT comparators only match while DEMCR.TRCENA
-// (kDemcrTrcEna) is set, so arming a watchpoint must set it first.
+// 比较器 n 位于 kDwtComp + 16*n（MASK +4、FUNCTION +8）。
+// DWT 只在 DEMCR.TRCENA 置位时才匹配，装观察点前必须先开。
 enum : uint32_t {
     kDwtCtrl         = kDwtBase + 0x00u,
     kDwtPcsr         = kDwtBase + 0x1Cu,
@@ -96,12 +95,9 @@ public:
     Core();
     ~Core();
 
-    // The Dap must already be Connected().
-    //
-    // `halt` is the Debug page's "Connect: without Stop": C_DEBUGEN is still
-    // written (the debug logic has to be enabled to read anything at all) but
-    // C_HALT is left clear, so a target that was already running keeps running.
-    // uVision then uses AG_WAITFORBRK to notice when it stops.
+    // 连接内核；Dap 必须已 Connected()。
+    // halt=false 对应“Connect without Stop”：只写 C_DEBUGEN 不写 C_HALT，
+    // 让本来在跑的目标继续跑，由 uVision 用 AG_WAITFORBRK 等它停下。
     bool Attach(Dap* dap, bool halt = true);
     bool IsAttached() const { return m_attached; }
 
@@ -111,18 +107,10 @@ public:
     bool Step();
     bool Reset(bool haltAfterReset);
 
-    // Drops DHCSR.C_STEP | C_MASKINTS with C_HALT still asserted, then reads
-    // DHCSR back and confirms the mask is gone.
-    //
-    // C_MASKINTS is what Step() arms (Keil's sequence), and on ARMv7-M it can
-    // only change while the core is in debug state - i.e. in a write that also
-    // sets C_HALT.  Resume()'s write has C_HALT = 0, so the hardware ignores
-    // it and the mask survives the resume; the target then runs with interrupts
-    // masked and a tick-driven main loop spins forever.  Hence Step() calls
-    // this when the step completes and Resume() calls it before letting go.
-    //
-    // Returns false when DHCSR could not be written or the read-back still
-    // shows C_MASKINTS: the caller must not report a clean stop / run then.
+    // 在保持 C_HALT 的情况下清掉 C_STEP | C_MASKINTS，并回读确认。
+    // C_MASKINTS 只能在 debug 态（同写 C_HALT）改，Resume() 的写会被硬件忽略，
+    // 漏清会让目标带着屏蔽中断跑、tick 主循环永远空转。
+    // 写失败或回读仍带屏蔽时返回 false，调用方不能报告干净的停/跑。
     bool ClearStepMaskInts();
 
     CpuState State();
@@ -137,12 +125,8 @@ public:
     bool ReadRegs(RgARMCM& r);       // GPR + xPSR + MSP + PSP + SYS
     bool WriteRegs(const RgARMCM& r);
 
-    // FPU registers (Cortex-M4F / M7), the RgARMFPU block AG_AllReg(AG_READFPU)
-    // has to answer with.  Best effort on read: a target without an FPU leaves
-    // the block zeroed and still reports success.  uVision asks for these
-    // whenever the device has one, and answering AG_INVALOP there is printed as
-    // "*** error 123: AGDI: invalid operation" - the whole register refresh then
-    // fails, which is what leaves the Registers window empty.
+    // FPU 寄存器（M4F / M7），对应 AG_AllReg(AG_READFPU)。
+    // 读尽力而为：没有 FPU 的目标返回全 0 但不报错，否则整个寄存器刷新会失败。
     bool ReadFpuRegs(RgARMFPU& f);
     bool WriteFpuRegs(const RgARMFPU& f);
 

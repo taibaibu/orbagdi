@@ -1,22 +1,7 @@
 /**
  * @file ORBAGDI_Etb.h
- * @brief ETB (Embedded Trace Buffer) / TMC-in-ETB-mode support.
- *
- * The ETB is an on-chip trace sink: instead of streaming the trace out of a
- * pin (SWO) it captures it into a RAM block that the debugger reads back
- * through the MEM-AP.  The trace data is exactly the same ITM/ETM stream the
- * SWO console decodes, so the captured ITM bytes are handed to the ITM decoder
- * in ORBAGDI_Itm.cpp and reach uVision through the very same callbacks.
- *
- * Life cycle, mirroring Keil's DbgCM (ETB.cpp):
- *      EtbDetect()    - CoreSight ROM table scan, records the ETB base
- *      EtbSetup()     - read RAM depth/width, latch the formatter mode
- *      EtbActivate()  - arm capture (call before resuming the target)
- *      EtbProcess()   - stop capture, read the RAM, decode (call after halt)
- *      EtbReset()     - forget everything (start of a debug session)
- *
- * All programming is done over the MEM-AP of the Dap; no RDDI trace extension
- * is involved (unlike SWO), so this works on any RDDI host.
+ * @brief ETB / TMC(ETB 模式) 片上 trace 缓冲。
+ * 数据与 SWO 同一条 ITM/ETM 流，全部经 MEM-AP 编程，不依赖 RDDI trace 扩展。
  */
 #pragma once
 
@@ -27,89 +12,58 @@ namespace orb { class Dap; }
 namespace orb {
 namespace agdi {
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
+// ---- 发现 ----
 
-// Scan the CoreSight ROM table for an ETB (or a Trace Memory Controller
-// configured in ETB mode).  Records the location on success.  Returns false
-// when the device has no usable ETB.
+// 扫 ROM 表找 ETB（或 ETB 模式的 TMC），找到就记下位置。
 bool EtbDetect(orb::Dap& dap);
 
-// True once EtbDetect() has found an ETB.
+// EtbDetect() 已找到 ETB。
 bool EtbAvailable();
 
-// True when the found sink is a TMC in ETB mode (registers/pointers differ
-// from a plain CoreSight ETB).
+// 找到的是 ETB 模式的 TMC（寄存器/指针与老式 ETB 不同）。
 bool EtbIsTmc();
 
-// Register base of the ETM found by the ROM scan (0 = the table has no ETM).
-//
-// The ETM address is a device fact, not a constant: it comes out of the same
-// CoreSight ROM table walk that finds the ETB, matched on the part numbers in
-// DbgCM/Debug.cpp:284-292 (PN_ETM_CM3 0x924 / CM4 0x925 / SC3 0x926 / CM7 0x975).
-// `ORBAGDI_Itm.cpp` used to hardcode 0xE0041000 + offset for six registers, which
-// is wrong on any part that puts its ETM elsewhere - and the only symptom is
-// "not a single packet arrives" (COMPAT_ANALYSIS.md §10.28 item 4).
+// ROM 扫到的 ETM 基址（0 = 表里没有 ETM）。
+// 基址是器件事实而非常量，硬编码会让 ETM 放在别处的芯片一个包都收不到。
 uint32_t EtbEtmBase();
 
-// Walk the CoreSight ROM table without touching the ETB state.
-//
-// `EtbDetect()` resets that state, so it cannot be used from the ITM/ETM side
-// where an ETB session may already be running.  This is the entry point that
-// resolves `EtbEtmBase()` for a session that only wants instruction trace.
+// 只扫 ROM 表、不动 ETB 状态（ITM/ETM 侧在 ETB 会话进行中也要用它）。
 bool EtbScanRom(orb::Dap& dap);
 
-// Number of ETM branches decoded from the ETB stream so far (0 when no ETM data
-// was seen).  The decoder is the AGDI-layer ETM decoder (ORBAGDI_Etm.h); the
-// decoded branches are kept for a future uVision Trace-window upload path.
+// 从 ETB 流解出的 ETM 分支数（0 = 没见过 ETM 数据）。
 unsigned EtbEtmBranchCount();
 
-// ---------------------------------------------------------------------------
-// Setup / control
-// ---------------------------------------------------------------------------
+// ---- 设置 / 控制 ----
 
-// Read the ETB properties (RAM depth and word width) and latch the formatter
-// mode.  Must be called after EtbDetect() and before EtbActivate().
+// 读 RAM 深度与字宽，锁存 formatter 模式；须在 EtbDetect() 之后、EtbActivate() 之前。
 bool EtbSetup(orb::Dap& dap);
 
-// Arm trace capture.  Call just before the target is resumed.
+// 武装采集，目标恢复运行前调。
 bool EtbActivate(orb::Dap& dap);
 
-// Register the trace window and mark the sink usable (official `ETB_Init`,
-// DbgCM/ETB.cpp:1317).  Returns false when no ETB was found - the official
-// answers EU32 ("ETB requested but not available") in that case.
+// 注册 trace 窗口并标记 sink 可用；没有 ETB 时返回 false（官方答 EU32）。
 bool EtbInit();
 
-// Manually flush the ETB and wait for the flush to finish (official
-// `ETB_Flush`, DbgCM/ETB.cpp:968).  Sets STOPFL, triggers FONMAN and polls for
-// up to 10 ms.  Also called by the stop-capture path.
+// 手动 flush 并等待完成（STOPFL + FONMAN，最多轮询 10 ms），停采集路径也会调。
 bool EtbFlush(orb::Dap& dap);
 
-// True when the ETB is stopped and its buffer can be safely read (official
-// `ETB_CanAccess`, DbgCM/ETB.cpp:1339): the formatter's FTSTOPPED bit is set.
+// ETB 已停、缓冲可安全读取（formatter 的 FTSTOPPED 置位）。
 bool EtbCanAccess(orb::Dap& dap);
 
-// Notice that the buffer was consumed, which enables another update from the
-// ETB (official `ETB_Clear`, DbgCM/ETB.cpp:1377).
+// 标记缓冲已消费，允许下一次 ETB 更新。
 void EtbClear();
 
-// Clear the formatter stop bits a previous stop left behind, so capture can be
-// armed again (official `ETB_Recovery`, DbgCM/ETB.cpp:1386).  A no-op while the
-// ETB is still capturing.
+// 清掉上次停止留下的 formatter 停止位，才能重新武装；采集期间是空操作。
 bool EtbRecovery(orb::Dap& dap);
 
-// Stop capture, read the whole buffer, decode it and forward the ITM packets
-// to uVision.  Call after the target has halted.  Returns the number of ETB
-// bytes processed (>= 0), or -1 on a hard error.
+// 停采集、读完整缓冲、解码并把 ITM 包转给 uVision；返回处理字节数，硬错误 -1。
 int EtbProcess(orb::Dap& dap);
 
-// Forget all state (address, properties, buffers).  Start of a session.
+// 丢掉全部状态（会话开始）。
 void EtbReset();
 
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
+// ---- 状态 ----
+
 struct EtbStatus {
     bool     present;     // an ETB/TMC was found
     bool     tmc;         // the sink is a TMC in ETB mode
@@ -120,14 +74,11 @@ struct EtbStatus {
     uint32_t width;       // RAM word width in bytes (3 or 4)
     bool     wraparound;  // last read wrapped around (oldest data lost)
 
-    // Trace sources seen in the captured stream (official `ETB_ITMConnected` /
-    // `ETB_ETMConnected`, DbgCM/ETB.h:47-48).  Latched while unpacking the
-    // formatter frames, so it reflects what the sink actually received.
+    // 流里出现过的 trace 源，解 formatter 帧时锁存。
     bool     itmConnected;
     bool     etmConnected;
 
-    // Trigger delay programmed into ETB_TRG_CNT at activation (official
-    // `ETB_TrigDelay`, DbgCM/ETB.h:42).
+    // 武装时写进 ETB_TRG_CNT 的触发延迟。
     uint32_t trigDelay;
 };
 

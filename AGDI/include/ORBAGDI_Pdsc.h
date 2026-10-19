@@ -1,20 +1,8 @@
 #pragma once
 
-// PDSC ("CMSIS-Pack Debug Description") support, limited to what a flash
-// download needs.
-//
-// uVision owns the debug description and the sequence interpreter.  It parses
-// the PDSC/SDF belonging to the connected device and hands the result to the
-// driver through the BOM (UV_PDSCDBG_GET_PROPERTIES in BOM.H), and it runs a
-// sequence when the driver asks it to (UV_PDSCDBG_EXEC_SEQUENCE).  Running a
-// sequence therefore means filling a PDSC_SEQUENCE_CONTEXT - sequence id, debug
-// access variables, debug context - and calling Notify(); every target access
-// the script performs comes back into this DLL through the ordinary AGDI
-// entry points (AG_MemAccX, AG_DapAcc, ...).
-//
-// None of this is invented here: the BOM is the very object uVision returns for
-// AG_CB_GETBOMPTR, and the request/response protocol is the one the reference
-// driver uses (DbgCM/PDSCDebug.cpp, DbgCM/AGDI.CPP).
+// PDSC（CMSIS-Pack 调试描述）支持，只做 flash 下载需要的部分。
+// uVision 解析描述并执行序列，驱动只负责填上下文、调 Notify()；
+// 脚本里每次目标访问都经 AGDI 入口回到本 DLL。
 
 #include <stdint.h>
 
@@ -23,71 +11,52 @@ struct bom;   // BOM.H
 namespace orb {
 namespace pdsc {
 
-// ---- session --------------------------------------------------------------
+// ---- session ----
 
-// Called from AG_Init(AG_INITITEM, AG_INITCALLBACK).  uVision's callback is the
-// only route to the BOM, and the BOM is the only route to the debug
-// description, so a driver that never stores it can never support PDSC.
+// 保存 uVision 回调给出的 BOM（通往调试描述的唯一途径）。
 void SetBom(struct bom* bom);
 
-// 只登记备用 BOM 实例，不顶掉已拿到的 ioc。用于 dbgblk::pDbgX->pBom 那条路：
-// 它与 AG_CB_GETBOMPTR 返回的 ioc 实测**不是同一个对象**，而 uVision 的
-// Trace Data 取数门读的是 ioc，所以 ioc 必须始终是主指针。见 SetBomAlt() 实现。
+// 只登记备用 BOM 实例，不顶掉已有的 ioc：两者实测不是同一对象，
+// 而 uVision 的 Trace Data 取数门读的是 ioc。
 void SetBomAlt(struct bom* bom);
 bool HaveBom();
 
-// uVision 的 BOM 对象（`pio`）。Trace Data 窗口的 TDI 注册要经它 Notify；
-// 没拿到 BOM 时返回 nullptr。
+// uVision 的 BOM 对象（pio），没拿到时返回 nullptr。
 struct bom* Bom();
 
-// 把 `bTrcDisp`（"Sxxx supports Trace-Display-Window"）写到**所有已知的 BOM 实例**上。
-//
-// uVision 会先后给出两个 BOM（AG_CB_GETBOMPTR 与 dbgblk::pDbgX->pBom），二者不保证
-// 是同一个实例；而 Trace Data 窗口的取数门读的是 uVision 自己持有的那一个。只写一个
-// 实例会出现"bTrcDisp 是 1、窗口却永不取数"。见 SetBom() 的说明。
+// 把 bTrcDisp 写到所有已知 BOM 实例上。
+// uVision 会先后给出两个实例，只写一个会出现“标志是 1、窗口却不取数”。
 void SetTraceDisplayFlag(bool on);
 
-/// `__traceout` —— 交给器件 pack 的 `TraceStart` 序列的参数。
-///
-///   bit0 = SWO 选中、bit1 = TPIU(并行) 选中、bits[21:16] = 并行位宽
-///
-/// 这是驱动唯一该做的"trace 物理层"动作：真正的寄存器编程（引脚/AF/`DBGMCU_CR`）由 pack 的
-/// `EnableTraceSWO` / `EnableTraceTPIU` 完成（器件厂写的、读-改-写）。**写 0 会让 pack 整个
-/// 空转**，于是那些配置只能靠固件手写顶着 —— 见 COMPAT_ANALYSIS.md §10.28。
+/// __traceout：交给 pack 的 TraceStart 序列。
+/// bit0 = SWO、bit1 = TPIU，bits[21:16] = 并行位宽。写 0 会让 pack 整个空转，
+/// 真正的寄存器编程由 pack 的 EnableTraceSWO / EnableTraceTPIU 完成。
 void SetTraceOut(uint32_t v);
 
-// BOM 里的 Thumb 位（"Thumb State (ARM)"，BOM.H:3636）。uVision 用它决定反汇编
-// 按哪套指令集解码；官方驱动在每次寄存器刷新时发布它（DbgCM/AGDI.CPP:3624
-// `pio->Thumb = (RegARM.xPSR & T_Bit) ? 1 : 0;`）。放在这里是因为只有本模块
-// 包含了 BOM.H。
+// BOM 的 Thumb 位：uVision 据此选择反汇编指令集，每次寄存器刷新时发布。
 void SetThumbState(bool thumb);
 
-// BOM 的 "last hit Bp" 记录（`struct hitbp`，BOM.H:3064/3952）。uVision 靠它知道
-// 目标停下来了、停在哪、为什么停，然后刷新调试视图——寄存器窗口就是靠这个信号
-// 才会被填充。官方在每次停下时填写（DbgCM/AGDI.CPP:7274 SetHitBp()），并在每次
-// AG_GoStep 入口先清成 HIT_NOREASON（:8025）。acc 取 BOM.H:3051-3062 的
-// HIT_* 常量；bpNum 不确定时传 0xFFFF。
+// BOM 的 "last hit Bp"：uVision 靠它知道目标停了、停在哪、为什么停。
+// acc 取 HIT_* 常量，bpNum 不确定时传 0xFFFF。
 void SetHitBp(uint32_t addr, uint16_t acc, uint16_t bpNum, uint32_t pc);
 void ClearHitBp();
 
-// Ask uVision for the debug description of the connected device.  Keeps the
-// previous state when uVision has nothing to offer.  Safe to call repeatedly.
+// 向 uVision 要目标调试描述；没有可取的就保持原状，可重复调用。
 bool Refresh();
 
 // Forget everything (AG_UNINIT, or a session that failed to connect).
 void Shutdown();
 
-// uVision offered a debug description and enabled its use.
+// uVision 提供了调试描述并启用了它。
 bool Available();
 
-// ... and flash programming sequences are enabled: from here on the download
-// goes through the sequences instead of an FLM algorithm.
+// 且 flash 编程序列已启用：下载走序列而不是 FLM。
 bool FlashSeqReady();
 
 // One-line state for the log, or NULL when there is nothing worth reporting.
 const char* Status();
 
-// ---- flash description ----------------------------------------------------
+// ---- flash description ----
 
 struct FlashInfo {
     uint32_t addr;         // flash device start address
@@ -106,35 +75,11 @@ bool FlashInfoFor(uint32_t adr, FlashInfo& out);
 // Program page size covering 'adr' (0 when unknown).
 uint32_t PageSizeFor(uint32_t adr);
 
-// ---- debug sequences: connect / reset / recovery ---------------------------
-//
-// These are the sequences a modern device's debug description uses to *become*
-// debuggable: unlocking a protected debug port, setting up the access port,
-// choosing where the core stops after reset.  They are not flash sequences, but
-// they run through exactly the same interpreter - a sequence id, the access
-// variables, a debug context, and Notify() - so they live here.
-//
-// Leaving them out is why a device whose description needs DebugPortSetup to
-// unlock can be recognised, identified, and still refuse to be attached to: the
-// classic path assumes the DP is usable the moment it answers.  Every sequence
-// below is optional; a description that has none leaves that path untouched.
-//
-// The names are the ones Keil's own driver carries (ULP2CM3.dll):
-//   "Prepares Debug Port for connection."
-//   "Connect to Debug Port and power up."
-//   "Power down Debug Port and disconnect from it."
-//   "Unlock device after connection to Debug Port."
-//   "Configure device specific logic for trace capture."
-//   "Clear configuration of device specific logic for trace capture."
-//   "Configure processor where to stop after reset."
-//   "Clear target configuration applied in \"ResetSetCatch\" sequence."
-//   "Execute custom reset sequence."
-//   "Configure device specific logic supporting recovery from a connection
-//    loss, e.g. because of a low-power mode."
+// ---- debug sequences: connect / reset / recovery ----
+// 让器件“变得可调试”的序列（解锁调试口、配 AP、决定复位后停在哪），
+// 与 flash 序列共用同一解释器，所以放在这里；每个序列都是可选的。
 
-/// How the next connect or reset is performed.  These are the bits that go into
-/// __connection, which is what the reset sequences branch on; the values are the
-/// AV_CONN_RST_* ones from PDSCDebugEngine.h.
+/// 下一次连接/复位怎么做，取值即 __connection 里序列分支用的 AV_CONN_RST_*。
 enum ResetType {
     kResetErr = 0,   // let the description decide (Autodetect)
     kResetHw  = 1,   // the reset line          - AV_CONN_RST_HW
@@ -142,9 +87,8 @@ enum ResetType {
     kResetVec = 3,   // AIRCR.VECTRESET         - AV_CONN_RST_VEC
 };
 
-/// How to describe the connection to the sequences.
-///   holdReset     - we are connecting while the reset line is held low
-///   preConnReset  - we pulsed reset before connecting
+/// 告诉序列这次连接的性质：holdReset = 复位线被拉住时连接，
+/// preConnReset = 连接前已打过复位脉冲。
 void SetResetMode(uint32_t resetType, bool holdReset, bool preConnReset);
 
 /// The description carries at least one debug (non-flash) sequence.
@@ -156,93 +100,59 @@ uint32_t DebugSeqCount();
 // The connection group, in the order the reference driver runs them.
 bool ConnectDebugPort();   // DebugPortSetup
 
-/// 器件描述里确实有 `DebugPortSetup`（存在且没被 disable）—— 与 `TraceSeqAvailable()`
-/// 同一个套路：`ConnectDebugPort()` 在序列不存在时返回 true，不能拿它判"跑成功没有"。
+/// 描述里确实有 DebugPortSetup：序列不存在时 ConnectDebugPort() 也返回 true，
+/// 不能用它判断“跑成功没有”。
 bool DebugPortSetupAvailable();
 
 bool StartDebugPort();     // DebugPortStart
 bool UnlockDevice();       // DebugDeviceUnlock
 bool StartCore();          // DebugCoreStart
 
-/// The disconnect group.  Best effort by design: the session is going away, and
-/// a description that cannot clean up must not stop it from ending.
+/// 断开组，尽力而为：描述清理不干净也不能阻止会话结束。
 void StopCore();           // DebugCoreStop
 void StopDebugPort();      // DebugPortStop
 
-/// Reset through the description.  Falls back
-/// ResetHardware -> ResetSystem -> ResetProcessor -> ResetCustomized, the order
-/// the reference driver uses; returns false only when the description has none
-/// of them or the one that ran failed.
+/// 经描述复位，依次回退 ResetHardware -> ResetSystem -> ResetProcessor -> ResetCustomized。
 bool Reset(uint32_t resetType);
 
-/// "Stop here after reset".  ResetCatchSet() answers "did the description take
-/// over?" - false means it has no such sequence (or the one it has failed), so
-/// the caller has to arrange the halt itself the classic way.
+/// “复位后停在这”。ResetCatchSet() 返回 false 表示描述没有该序列或执行失败。
 bool ResetCatchSet();
 bool ResetCatchClear();
 
-/// Assert / deassert the reset line through the description.
-///
-/// These two are the "recover under reset" pair: `AG_RECOVERY_CONF` asks the
-/// driver to hold the target in reset while uVision re-establishes a debug
-/// connection it has lost (`DbgCM/DebugAccess.cpp:737-783`), and the recovery
-/// ladder releases the line once the DP answers again (`:608-625`).
-///
-/// false means the description carries no such sequence.  There is deliberately
-/// no fallback: the reference's own default implementation is a `TODO`
-/// (`PDSCDebug.cpp:4057-4082` only runs the sequence), so the caller has to know
-/// that the line was *not* driven.
+/// 经描述拉/放复位线（recover under reset 用）。
+/// 返回 false 表示描述没有该序列，没有后备实现，调用方要自己知道线没被驱动。
 bool ResetHardwareAssert();     // SEQ_ResetHardwareAssert
 bool ResetHardwareDeassert();   // SEQ_ResetHardwareDeassert
 
-/// RecoverySupportStart / Stop - the device-side half of surviving a lost debug
-/// connection (a low-power mode that would otherwise take the DP down with it).
+/// RecoverySupportStart / Stop：设备侧扛住调试连接丢失（如低功耗）。
 bool RecoveryStart();
 bool RecoveryStop();
 
-/// RecoveryAcknowledge - "Acknowledge recovery from a connection loss to the
-/// device specific logic supporting the recovery" (SEQ_RecoveryAcknowledge).
-///
-/// The reference runs it at the very end of a successful recovery, and only when
-/// the description is enabled (`DbgCM/DebugAccess.cpp:659-663`).  Optional by
-/// design: the reference marks it "No default implementation" and swallows an
-/// absent sequence (`PDSCDebug.cpp:4260-4273`).
+/// RecoveryAcknowledge：恢复成功收尾时调，描述没有该序列也算成功。
 bool RecoveryAcknowledge();
 
 /// TraceStart / TraceStop - the device-side trace capture setup.
 bool TraceStart();
 bool TraceStop();
 
-/// Does the description carry a `TraceStart` sequence?
-///
-/// This is the gate for the driver's own `DBGMCU_CR` fallback, and it mirrors the
-/// reference's test exactly: `DbgCM/PDSCDebug.cpp:4279 PDSCDebug_TraceStart()`
-/// runs `_ExecuteSequence(SEQ_TraceStart)` and, when the sequence exists, returns
-/// without touching anything - the comment under it reads "No default
-/// implementation".  The pack's `EnableTraceSWO` / `EnableTraceTPIU` already write
-/// the trace pins and `DBGMCU_CR`; a driver that writes them too is writing a
-/// second time (COMPAT_ANALYSIS.md §10.28).
-///
-/// The driver's own write is the fallback for a description that has no such
-/// sequence (older device, or a session without PDSC at all).
+/// 描述里是否有 TraceStart：有的话驱动不再自己写 DBGMCU_CR，
+/// 否则会和 pack 的 EnableTraceSWO / EnableTraceTPIU 写重。
 bool TraceSeqAvailable();
 
-// ---- flash sequences ------------------------------------------------------
+// ---- flash sequences ----
 
-// Optional hooks: return true when the sequence is absent, so a device that
-// only describes erase+program still gets programmed.
+// 可选钩子：序列不存在时返回 true，只有擦+写描述的器件也能编程。
 bool Init();
 bool Uninit();
 bool EraseDone();
 bool ProgramDone();
 
-// Required: the caller only takes this path when FlashSeqReady() is true.
+// 必需：调用方只在 FlashSeqReady() 为真时走这条路。
 bool EraseSector(uint32_t adr);
 bool EraseChip(uint32_t adr, uint32_t size);
 bool ProgramPage(uint32_t adr, uint32_t size, uint32_t dataAdr);
 
-// Debug Context under which the next sequence runs (DBGCON_* in
-// PDSCDebugEngine.h); the sequences branch on it.
+// 下一次序列运行所用的 Debug Context（DBGCON_*），序列按它分支。
 void     SetDebugContext(uint32_t ctx);
 uint32_t DebugContext();
 

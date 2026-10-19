@@ -1,24 +1,9 @@
 /**
  * @file ORBAGDI_V8M.h
- * @brief ARMv8-M Security Extension support (Secure / Non-Secure debug).
- *
- * Port of Keil's DbgCM `#if DBGCM_V8M` block onto this driver:
- *
- *   IsV8M()                     DbgCM/AGDI.CPP:17958
- *   DetectSecurityExtensions()  DbgCM/AGDI.CPP:17983
- *   UpdateSecurityState()       DbgCM/AGDI.CPP:18028
- *   UpdateDebugAuthentication() DbgCM/AGDI.CPP:18059
- *   NonSecureCantStop()         DbgCM/AGDI.CPP:18087
- *   SevereTargetError()         DbgCM/AGDI.CPP:18111
- *
- * Why this matters even for a v7-M part: a v8-M device whose debug port is open
- * only to a non-secure debugger cannot be halted while the CPU runs secure code.
- * The reference does not treat that as a broken connection - it degrades the
- * error to a warning so the session survives. Reporting it as a fatal error is
- * what turns "the debugger cannot see secure state" into "the debugger died".
- *
- * All register access goes through the MEM-AP of orb::Dap, so nothing here
- * needs the reference's own access layer.
+ * @brief ARMv8-M 安全扩展（Secure / Non-Secure 调试），移植 Keil DbgCM 的 #if DBGCM_V8M 块。
+ * 调试口只对非安全调试器开放时，CPU 跑安全代码就停不下来；
+ * 参考实现把这种错误降级成警告而不是判死，否则“看不到安全态”会变成“调试器挂了”。
+ * 寄存器访问全部走 orb::Dap 的 MEM-AP。
  */
 #pragma once
 
@@ -29,7 +14,7 @@ namespace orb { class Dap; }
 namespace orb {
 namespace agdi {
 
-// Official SEV_ERR_* (DbgCM/COLLECT.H:418-421).
+// 官方 SEV_ERR_*。
 enum : unsigned {
     kSevErrStop   = 1, // Cannot stop target
     kSevErrReset  = 2, // Cannot reset target
@@ -37,10 +22,7 @@ enum : unsigned {
     kSevErrReinit = 4, // Cannot reinit target
 };
 
-// The CPU types the reference classifies as v8-M (DbgCM/AGDI.CPP:17958).  The
-// caller passes whatever its own CPU identification produced; the values here
-// are the reference's ARM_CM* enumeration, so a caller with a different scheme
-// maps onto them rather than guessing.
+// 参考实现的 ARM_CM* 枚举，调用方把自己识别的 CPU 映射到这套值上。
 enum : unsigned {
     kCpuCM0    = 0,
     kCpuCM0P   = 1,
@@ -55,21 +37,17 @@ enum : unsigned {
     kCpuCM35P  = 10,  // v8-M Mainline with Physical Security
 };
 
-// Official IsV8M(): CM23 / CM33 / CM35P are v8-M, everything else is not.
+// CM23 / CM33 / CM35P 是 v8-M，其余不是。
 bool IsV8M(unsigned cpuType);
 
-// CPUID.PARTNO (SCS 0xE000ED00 bits 15:4) -> the enumeration above.  Keil
-// classifies the CPU while identifying the device (its `xxCPU` comes from the
-// device database); this driver reads CPUID directly, so the part number has to
-// be mapped here.  An unrecognised part number maps to a non-v8-M entry, so an
-// unknown device is never credited with Security Extensions it may not have.
+// CPUID.PARTNO → 上面的枚举。
+// 认不出的 PARTNO 映射成非 v8-M，避免凭空给未知器件加上安全扩展。
 unsigned V8mCpuTypeFromPartNo(unsigned partNo);
 
-// True for v8-M Mainline (CM33 / CM35P).  Mainline answers NVIC_PFR1, Baseline
-// has to be asked through DBG_AUTHSTATUS instead.
+// v8-M Mainline（CM33/CM35P）；Mainline 能读 NVIC_PFR1，Baseline 只能查 DBG_AUTHSTATUS。
 bool IsV8MMainline(unsigned cpuType);
 
-// Official pio->bSecureExt / bCPUSecure / b*DbgEna / b*TrcEna, plus DSCSR's CDSKEY.
+// 对应 pio->bSecureExt / bCPUSecure / b*DbgEna / b*TrcEna 与 DSCSR.CDSKEY。
 struct V8mStatus {
     bool secureExt;  // Security Extensions available
     bool cpuSecure;  // current CPU security state
@@ -83,34 +61,24 @@ struct V8mStatus {
 
 V8mStatus V8mGetStatus();
 
-// Official DetectSecurityExtensions() (DbgCM/AGDI.CPP:17983).  Decides whether
-// the device has Security Extensions at all; for a non-v8-M part this answers
-// false and leaves the status cleared.  On success it also runs the two update
-// functions below, exactly as the reference does.
+// 判断器件有没有安全扩展；非 v8-M 返回 false 并把状态清零。
+// 成功后会接着跑下面两个 Update，与参考实现一致。
 bool V8mDetectSecurityExtensions(orb::Dap& dap, unsigned cpuType);
 
-// Official UpdateSecurityState() (DbgCM/AGDI.CPP:18028): read DBG_SCSR and
-// publish the CPU's current security state.
+// 读 DBG_SCSR，发布当前安全状态。
 bool V8mUpdateSecurityState(orb::Dap& dap);
 
-// Official UpdateDebugAuthentication() (DbgCM/AGDI.CPP:18059): read
-// DBG_AUTHSTATUS and DBG_HCSR and publish the four debug/trace enable flags.
+// 读 DBG_AUTHSTATUS / DBG_HCSR，发布四个调试/跟踪使能位。
 bool V8mUpdateDebugAuthentication(orb::Dap& dap);
 
-// Official NonSecureCantStop() (DbgCM/AGDI.CPP:18087): "non-secure debugger,
-// CPU in secure mode".  Refreshes the authentication status first, like the
-// reference does.  Never true for a v7-M part.
+// “非安全调试器 + CPU 在安全态”：先刷新认证状态再判断；v7-M 永远为 false。
 bool V8mNonSecureCantStop();
 
-// Official SevereTargetError() (DbgCM/AGDI.CPP:18111).
-//   returns 0 - fatal: the caller should shut the session down
-//   returns 1 - degraded to a warning because NonSecureCantStop() is true
+// 返回 0 = 致命（调用方应结束会话）；返回 1 = 因 NonSecureCantStop() 降级为警告。
 int V8mSevereTargetError(unsigned errType);
 
-// Official SevereTargetError() ends in SetPlayDead(msg).  This driver has no
-// global PlayDead state - its equivalent is "the session is no longer
-// connected" - so the teardown is delegated to a hook the AGDI layer installs.
-// With no hook installed the fatal path only logs.
+// 参考实现最后调 SetPlayDead(msg)，本驱动的等价物是“会话不再连接”，
+// 具体收尾由 AGDI 层装的钩子做；没装钩子时只记日志。
 typedef void (*V8mPlayDeadFn)(const char* msg);
 void V8mSetPlayDeadHook(V8mPlayDeadFn fn);
 

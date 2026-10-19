@@ -1,9 +1,7 @@
 /**
  * @file ORBAGDI_Dap.h
- * @brief Debug Access Port layer: DP/AP register access + MEM-AP memory access.
- *
- * Everything below uses a single MEM-AP (default index 0, configurable).
- * Memory accesses auto-increment TAR through the AP's DRW register.
+ * @brief DAP 层：DP/AP 寄存器访问 + MEM-AP 内存访问。
+ * 只用一个 MEM-AP（默认 0，可配），内存访问经 DRW 自增 TAR。
  */
 #pragma once
 
@@ -45,9 +43,7 @@ public:
     int  ApIndex() const { return m_apIndex; }
 
     // ---- raw DP / AP register access -------------------------------------
-    // regId is the *encoded* RDDI register id from ORBAGDI_Rddi.h - DP 0..3
-    // (DAP_DP_REG_*), AP 4..7 (DAP_AP_REG_*) - NOT a byte address.  Passing a
-    // byte address here is what made CTRL/STAT read back the DPIDR (bug.md E7).
+    // regId 是 ORBAGDI_Rddi.h 里的编码寄存器号（DP 0..3 / AP 4..7），不是字节地址。
     bool ReadDP(uint32_t regId, uint32_t& value);
     bool WriteDP(uint32_t regId, uint32_t value);
     // AP register access, bank 0 (CSW/TAR/DRW) or 0xF (IDR/BASE); regId is a
@@ -66,23 +62,16 @@ public:
     bool MemWrite16(uint32_t addr, uint16_t v) { return MemWrite(addr, &v, 2); }
     bool MemWrite32(uint32_t addr, uint32_t v) { return MemWrite(addr, &v, 4); }
 
-    // Force the next MEM-AP access to reprogram CSW.  The ETB read path writes
-    // a non-incrementing CSW directly (the RD_DATA port advances its own
-    // pointer, so TAR must not move), which leaves m_cswCache stale; without
-    // this the following MemRead would skip the CSW write and run with the
-    // non-incrementing value still in the AP.
+    // 强制下次 MEM-AP 访问重写 CSW。
+    // ETB 读路径直接写了不自增的 CSW，缓存会失真，不重写会带着旧值跑。
     void InvalidateCswCache() { m_cswCache = 0xFFFFFFFFu; }
 
     // ---- target control ---------------------------------------------------
     bool ClearStickyErrors();
     bool PowerUpDebug();
 
-    // 参考 `SWD_CheckStatus()`（DbgCM/SWD.cpp:194-213）：把 RDDI 的原始返回码翻成
-    // 语义，并按码做**对应的 ABORT 寄存器写**。
-    //
-    // ⚠ 不是线复位。参考的 `SWJ_Reset()` 是空函数（"RDDI will handle this
-    //   automatically, no need to send the sequence again"）；把链路拉回来的是这两个
-    //   ABORT 写。返回 0 或 `rddi::kRddiDap*` 的语义化结果。
+    // 把 RDDI 原始返回码翻成语义，并按码写对应的 ABORT 寄存器。
+    // 这恢复链路不靠线复位（RDDI 自己处理），靠的就是这两个 ABORT 写。
     int CheckDapStatus(int rc);
 
     // Drives nRESET through the probe's SWJ pin interface (CMSIS-DAP pin 7).
@@ -93,19 +82,14 @@ public:
 
     int LastError() const { return m_lastError; }
 
-    // 任一次 DP/AP 访问失败都会置起它。后台监视器据此决定要不要做等级探测 ——
-    // **健康的会话因此完全不产生额外探针流量**，P0-A 的"无源不碰锁"保证不受影响；
-    // 只有真出过错才会去探。成功探测后由 `DebugAccessDetection()` 清掉。
+    // 任一次 DP/AP 访问失败都会置起，成功探测后由 DebugAccessDetection() 清掉。
+    // 后台监视器只在置起时才做等级探测，健康会话因此不产生额外探针流量。
     bool AccessSuspect() const { return m_accessSuspect; }
     void ClearAccessSuspect() { m_accessSuspect = false; }
     RDDIHandle Handle() const { return m_handle; }
 
     // ---- read cache (Debug page "Cache Code" / "Cache Memory") ------------
-    // uVision re-reads the same code and data constantly - disassembly, the
-    // memory window, the source view - and every read is a MEM-AP round trip.
-    // Only *successful whole reads* are cached, never speculative fetches, so a
-    // hit can never touch an address the caller did not ask for.  A write that
-    // overlaps a line drops it, and so does a run-control change.
+    // 只缓存整段成功的读，不做投机预取；写入重叠或运行状态变化时丢行。
     void CacheFlush();
 
 private:

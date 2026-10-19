@@ -106,14 +106,18 @@ New-Item -ItemType Directory -Force -Path $ObjDir, $BinDir | Out-Null
 # Sources - the real dialog plus its dependencies, plus the preview main.
 # ---------------------------------------------------------------------------
 $Sources = @(
-    (Join-Path $Root    'src\ORBAGDI_Settings.cpp'),
-    (Join-Path $Root    'src\ORBAGDI_Config.cpp'),
-    (Join-Path $Root    'src\ORBAGDI_Log.cpp'),
-    (Join-Path $Root    'src\ORBAGDI_Rddi.cpp'),
+    (Join-Path $Root    'src\app\ORBAGDI_Settings.cpp'),
+    (Join-Path $Root    'src\app\ORBAGDI_Config.cpp'),
+    (Join-Path $Root    'src\app\ORBAGDI_Log.cpp'),
+    (Join-Path $Root    'src\coresight\ORBAGDI_Rddi.cpp'),
     # The Power page has to be able to actually send (that is its whole point), so
     # this one comes along.  It only uses the two OrbTrace_SetVoltage* exports and
     # depends on nothing else - see include\ORBAGDI_Power.h.
-    (Join-Path $Root    'src\ORBAGDI_Power.cpp'),
+    (Join-Path $Root    'src\target\ORBAGDI_Power.cpp'),
+    # Settings.cpp 里"取消 Trace Enable 当场收源"要调 orb::agdi::StopTraceSources()，
+    # 实现在 src\app\ORBAGDI_Agdi.cpp（会话层：DAP / USB / 状态机）。预览没有会话，
+    # 所以用 stub\AGDIStub.cpp 里同签名的替身，src 再长也往那个文件里加。
+    (Join-Path $TestDir 'stub\AGDIStub.cpp'),
     (Join-Path $TestDir 'ORBAGDI_SettingsPreview.cpp')
 )
 foreach ($s in $Sources) {
@@ -123,7 +127,9 @@ foreach ($s in $Sources) {
 $Flags = @(
     '/c', '/nologo', '/O2', '/MT', '/W3', '/EHsc', '/std:c++17', '/utf-8',
     '/D_CRT_SECURE_NO_WARNINGS', '/DWIN32', '/D_WINDOWS',
-    "/I$Root\src", "/I$Root\include", "/I$Root"
+    "/I$Root\src", "/I$Root\include", "/I$Root",
+    # Keil 官方 AGDI SDK 头（include\sdk）：这些源里写的是裸名字 "BOM.H" / "AGDI.H"。
+    "/I$Root\include\sdk"
 )
 
 Write-Step 'Compiling'
@@ -251,7 +257,7 @@ if (-not $CobsSrc -or -not (Test-Path $CobsSrc)) {
 # so this step is skipped when either is missing.
 # ---------------------------------------------------------------------------
 Write-Step 'Compiling the ETM replay tool'
-$DecDir = Join-Path $Root 'traceDec'
+$DecDir = Join-Path $Root 'src\coresight\traceDec'
 if (-not $CobsSrc -or -not (Test-Path $CobsSrc)) {
     Write-Host '    skipped - needs the orbuculum checkout (for cobs.c)' -ForegroundColor DarkGray
 } elseif (-not (Test-Path (Join-Path $DecDir 'traceDecoder.cpp'))) {

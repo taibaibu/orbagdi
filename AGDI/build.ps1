@@ -37,10 +37,16 @@ Set-StrictMode -Version Latest
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $SrcDir    = Join-Path $ScriptDir 'src'
 $IncDir    = Join-Path $ScriptDir 'include'
-# 第三方移植代码：orbuculum 的 trace 解码器（BSD-3-Clause，见 traceDec/ 与
-# COMPAT_ANALYSIS.md §10.21）。单独一个目录，与 DbgCM\ 同样的处理方式 ——
-# 来源清楚、便于与上游对照、不会和自研代码混在一起。
-$DecDir    = Join-Path $ScriptDir 'traceDec'
+# Keil 官方 AGDI SDK 头（AGDI.H / AGSI.h / agdi_types.h / BOM.H / COMTYP.H /
+# ALLOC.H / UVSOCK.h / TraceDat.h / TracePointDefs.h / PDSCDebugEngine.h）
+# 与自研 ORBAGDI_*.h 分开放，靠 /I 让源码里的裸名字 include 仍能解析。
+# 名字不能叫 $SdkIncDir：PowerShell 变量不分大小写，会和下面的 Windows SDK
+# 变量 $sdkIncDir 撞成同一个，被覆盖后 /I 悄悄丢掉。
+$AgdiSdkIncDir = Join-Path $IncDir 'sdk'
+# 第三方移植代码：orbuculum 的 trace 解码器（BSD-3-Clause，见 COMPAT_ANALYSIS.md §10.21）。
+# 2026-10-19 起放在 src\coresight\traceDec —— 归到实现层下，但仍保留 traceDec\
+# 这一层：来源清楚、便于与上游对照、不会和自研代码混在一起。
+$DecDir    = Join-Path $SrcDir 'coresight\traceDec'
 # 第三方：capstone 反汇编器（BSD-3-Clause）。源码不在这里 —— 静态库由
 # capstone\build.ps1 从 PyPI 的 sdist 编出来（为什么必须自己编：见该脚本与
 # Todo.md 的 2026-10-14 那一节）。缺库时下面会直接报错，不会静默少编。
@@ -305,7 +311,13 @@ $CompilerFlags = @(
     '/utf-8',
     '/D_CRT_SECURE_NO_WARNINGS',
     '/DWIN32', '/D_WINDOWS',
+    # 引号 include 先找源文件同目录，再按 /I 顺序找。自研头都在 include\；
+    # traceDec\ 是第三方移植代码自带的头；ScriptDir 供 "TraceView\..." 用。
     "/I$IncDir", "/I$DecDir", "/I$ScriptDir",
+    # Keil 官方 AGDI SDK 头单独一层（include\sdk）。源码里写的是裸名字
+    # （"BOM.H" / "AGDI.H" / "TraceDat.h" …），靠这个 /I 解析，所以 src 下的
+    # include 一行都不用带路径。
+    "/I$AgdiSdkIncDir",
     "/I$CapInc"                 # capstone（P1-0 的指令解码器）
 )
 
@@ -314,10 +326,20 @@ if (-not (Test-Path $CapLib)) {
 }
 
 $sources  = @()
-$sources += Get-ChildItem -Path $SrcDir -Filter *.cpp -File
-$sources += Get-ChildItem -Path $DecDir -Filter *.cpp -File
+# src\ 按目录分组（app / coresight / target / trace），pch.cpp 留在根。
+# traceDec 在 coresight 下，递归已覆盖，所以**不要**再单独 glob 一次 ——
+# 同一个文件进两次会让下面的同名检测直接 Fail。
+$sources += Get-ChildItem -Path $SrcDir -Filter *.cpp -File -Recurse
 $sources  = $sources | Sort-Object Name
 if (-not $sources) { Fail "no sources found in $SrcDir or $DecDir" }
+
+# obj\<name>.obj 与 dep\<name>.d 都按 BaseName 命名，两个子目录出现同名 .cpp
+# 会静默互相覆盖（链接时只看到少了一个目标文件）。先拦下来，别让它悄悄过。
+$dupNames = $sources | Group-Object BaseName | Where-Object { $_.Count -gt 1 }
+if ($dupNames) {
+    Fail ("duplicate source file name(s) - obj would collide: " +
+          (($dupNames | ForEach-Object { $_.Name }) -join ', '))
+}
 
 # ---------------------------------------------------------------------------
 # Incremental gate — real dependency tracking

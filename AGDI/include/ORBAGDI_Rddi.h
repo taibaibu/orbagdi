@@ -1,13 +1,7 @@
 /**
  * @file ORBAGDI_Rddi.h
- * @brief Dynamic loader + call bridge for the RDDI layer (CMSIS_DAP.dll).
- *
- * The AGDI DLL never links against the RDDI layer; it loads it at run time so
- * that the RDDI DLL can be swapped (e.g. ORBMDK_RDDI.dll) without rebuilding.
- *
- * Signatures are copied verbatim from the standard ARM RDDI headers
- * (rddi.h / rddi_dap.h / rddi_dap_cmsis.h) and from ORBMDK/include/ORBMDK_RDDI.h.
- * All RDDI entry points use the C default calling convention (__cdecl).
+ * @brief RDDI 层（CMSIS_DAP.dll）的动态加载与调用桥。
+ * 运行期加载，RDDI DLL 可随意替换而不必重编；签名照抄 ARM RDDI 头。
  */
 #pragma once
 
@@ -25,19 +19,12 @@ typedef struct _RDDI_DAP_CONN_DETAILS {
 typedef void (*RDDILogCallback)(void* context, const char* const msg, const int logLevel);
 
 // ---------------------------------------------------------------------------
-// DAP register identifiers, as expected by DAP_ReadReg / DAP_WriteReg.
-//   DP : 0..3  -> DP address 0x0 / 0x4 / 0x8 / 0xC
-//   AP : 4..7  -> AP address 0x0 / 0x4 / 0x8 / 0xC (bank selected via DP SELECT)
-// These values are ALREADY encoded ids, not byte addresses: pass them straight
-// to DAP_ReadReg / DAP_WriteReg and never shift them again.  Keil's DbgCM gets a
-// byte address from its callers and encodes it itself with
-// "DAP_REG_DP_0x0 + (adr >> 2)"; copying that expression on top of these
-// constants double-shifted every access and broke the whole MEM-AP (bug.md E7).
-// The direction is the function you call - DAP_ReadReg vs DAP_WriteReg - so a
-// read is NOT "OR in DAP_REG_RnW".  DAP_REG_RnW / DAP_REG_WaitForValue belong
-// to DAP_RegAccessBlock alone.
-// The AP bank is selected by writing DP SELECT (regID 2) with
-//      (apIndex << 24) | (bank << 4)
+// DAP 寄存器号（DAP_ReadReg / DAP_WriteReg 用）。
+//   DP : 0..3  -> DP 地址 0x0 / 0x4 / 0x8 / 0xC
+//   AP : 4..7  -> AP 地址 0x0 / 0x4 / 0x8 / 0xC（bank 由 DP SELECT 选）
+// 这些已是编码后的 id，不是字节地址，不要再移位。
+// 读写方向由调用的函数决定，不要自己 OR 上 DAP_REG_RnW。
+// AP bank 通过写 DP SELECT = (apIndex << 24) | (bank << 4) 选择。
 // ---------------------------------------------------------------------------
 enum : int {
     DAP_REG_DP_0x0 = 0,   // IDCODE (read) / ABORT (write)
@@ -56,16 +43,8 @@ enum : int {
 
 // ---------------------------------------------------------------------------
 // RDDI-DAP 接口错误码（ARM rddi_dap.h，0x1000 段）
-// ---------------------------------------------------------------------------
-// Keil 的 AGDI 按**具体数值**识别这两个码并做特殊处理（`DbgCM/SWD.cpp:194-213`
-// `SWD_CheckStatus()`）：
-//
-//   RDDI_DAP_OPERATION_TIMEOUT (0x100E) -> 写 ABORT(DAPABORT) 后重试
-//   RDDI_DAP_DP_STICKY_ERR     (0x100F) -> 写 ABORT(STKERRCLR|WDERRCLR) 后重试
-//
-// 宿主把 SWD 的 FAULT 映射成后者、WAIT/NO_ACK 映射成前者
-// （`orbrddi-main/src/ORBMDK_RDDI.cpp:1873-1880`）。匹配不上就会把**可恢复的
-// 瞬时状态**当成普通错误直接上报 —— 表现就是"一次越界访问之后链路再也不回来"。
+// 这两个码要按数值特判并写对应 ABORT 后重试（0x100E → DAPABORT，
+// 0x100F → STKERRCLR|WDERRCLR）；漏判会把可恢复的瞬时状态当死错误上报。
 enum : int {
     kRddiDapOpTimeout   = 0x100E,   // RDDI_DAP_OPERATION_TIMEOUT
     kRddiDapStickyErr   = 0x100F,   // RDDI_DAP_DP_STICKY_ERR
@@ -114,16 +93,9 @@ struct Api {
     int (*CMSIS_DAP_Detect)(const RDDIHandle handle, int* noOfIFs);
     int (*CMSIS_DAP_Identify)(const RDDIHandle handle, int ifNo, int idNo, char* str, const int len);
     int (*CMSIS_DAP_ConfigureInterface)(const RDDIHandle handle, int ifNo, char* str);
-    // The real "connect to the target" entry point, and the one Keil's AGDI uses.
-    // It performs the SWJ/SWD switch sequence and the first DPIDR read; DAP_Connect
-    // is a stub that only fills an implementor string and does no link work at all
-    // (ORBMDK Usage.md §2, COMPAT_ANALYSIS.md §4.4).  Without it the DP is never
-    // brought up and every DAP register access fails - which is exactly what the
-    // settings sheet's AP probe used to hit.
-    //   SWD : DAP_Connect(port=SWD) -> JTAG-to-SWD (0xE79E) -> read DPIDR -> ABORT
-    //   JTAG: DAP_Connect(port=JTAG) -> SWD-to-JTAG (0xE73C) -> scan chain -> IDCODE
-    // *connectedInterface is written only when it points at writable memory, and
-    // receives 1 = SWD / 2 = JTAG; the layer checks writability itself.
+    // 真正“连上目标”的入口：做 SWJ/SWD 切换序列并读第一次 DPIDR。
+    // DAP_Connect 只是填个字符串的空壳，不调它 DP 永远起不来。
+    // *connectedInterface 仅在可写时回填 1 = SWD / 2 = JTAG。
     int (*CMSIS_DAP_Connect)(const RDDIHandle handle, int* connectedInterface);
     int (*CMSIS_DAP_DetectNumberOfDAPs)(const RDDIHandle handle, int* noOfDAPs);
     int (*CMSIS_DAP_DetectDAPIDList)(const RDDIHandle handle, int* DAP_ID_Array, size_t sizeOfArray);
@@ -174,17 +146,10 @@ struct Api {
     int (*TraceStream_DroppedBytes)(const RDDIHandle handle, unsigned long long* dropped);
 };
 
-// ---------------------------------------------------------------------------
-// OrbTrace_GetInfo 回填的结构，与 orbrddi-main/include/ORBMDK_OrbTrace.h 的
-// ORBMDK_OrbTrace_Info 逐字段对应。
-//
-// 放在这里（而不是某个 .cpp 的匿名 namespace 里）是因为**两个**翻译单元要用它：
-// ORBAGDI_OrbTrace.cpp（设备信息）与 ORBAGDI_Power.cpp（判断有没有 Power 接口）。
-// 不直接包含 RDDI 层的头，免得把 ORBMDK 的头拉进 AGDI 的编译单元。
-//
-// ⚠ 字段类型要和 RDDI 层**逐字节**对齐（那里是 int / uint16_t / char[]），
-//   所以不能拿 bool 顶替 int，也不能 reinterpret_cast 成别的结构。
-// ---------------------------------------------------------------------------
+// OrbTrace_GetInfo 回填的结构，与 RDDI 层 ORBMDK_OrbTrace_Info 逐字段对应。
+// 放在头里是因为 OrbTrace.cpp 与 Power.cpp 都要用；字段类型必须逐字节对齐，
+// 不能拿 bool 顶替 int，也不能 reinterpret_cast 成别的结构。
+
 struct RddiOrbTraceInfo {
     int      present;
     int      opened;
@@ -222,17 +187,9 @@ const Api& Get();
 int  LastErrorCode();
 void LastErrorText(char* buf, size_t len);
 
-/// The host's own interface config string for CMSIS_DAP_ConfigureInterface:
-/// which port to drive (SWD / JTAG) and whether the SWJ-DP may switch between
-/// them.  `buf`/`cch` receive the text; the return value is what to pass as the
-/// third argument - nullptr when there is nothing to say, which is the plain SWD
-/// case, so the call stays exactly the one this driver has always made.
-///
-/// Shared between the real connect sequence (Dap::Connect) and the settings
-/// sheet's AP probe (ProbeAps).  They used to build it separately, and the sheet
-/// did not configure the interface at all - so it probed a session with no
-/// interface bound and reported "no target answered the AP probe" on a bench
-/// where the target was answering fine.
+/// CMSIS_DAP_ConfigureInterface 的接口串（端口 SWD/JTAG、是否允许切换）。
+/// 返回值即第三个实参，没什么可说时返回 nullptr（纯 SWD 的情况）。
+/// 真实连接与设置页 AP 探测共用，两边各写一份会让探测绑不上接口。
 char* InterfaceConfig(char* buf, size_t cch);
 
 } // namespace rddi
